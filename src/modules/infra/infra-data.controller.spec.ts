@@ -34,10 +34,12 @@ import { MessageBatch, BatchStatus } from '../message/entities/message-batch.ent
 import { Template } from '../template/entities/template.entity';
 import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
 import { LidMapping } from '../../engine/identity/lid-mapping.entity';
+import { ChatState } from '../../engine/adapters/baileys-chat-state.entity';
 import { PluginInstance } from '../integration/entities/plugin-instance.entity';
 import { ConversationMapping } from '../integration/entities/conversation-mapping.entity';
 import { IngressEvent } from '../integration/entities/ingress-event.entity';
 import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
+import { WebhookOutboxEvent } from '../webhook/entities/webhook-outbox-event.entity';
 import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
 import { StatusUpdate } from '../status-store/entities/status-update.entity';
 import { AutomationRule } from '../automation/entities/automation-rule.entity';
@@ -70,10 +72,12 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
         Template,
         BaileysStoredMessage,
         LidMapping,
+        ChatState,
         PluginInstance,
         ConversationMapping,
         IngressEvent,
         WebhookDeliveryFailure,
+        WebhookOutboxEvent,
         IntegrationDeliveryFailure,
         StatusUpdate,
         AutomationRule,
@@ -1209,10 +1213,12 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
         Template,
         BaileysStoredMessage,
         LidMapping,
+        ChatState,
         PluginInstance,
         ConversationMapping,
         IngressEvent,
         WebhookDeliveryFailure,
+        WebhookOutboxEvent,
         IntegrationDeliveryFailure,
         StatusUpdate,
         AutomationRule,
@@ -1263,6 +1269,38 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
     expect(await lidRepo.count()).toBe(2);
     expect((await lidRepo.findOneByOrFail({ lid: '111' })).phone).toBe('628111');
     expect((await lidRepo.findOneByOrFail({ lid: '222' })).phone).toBeNull();
+  });
+
+  // Restoring ONTO the instance that produced the archive is the rollback flow, and it is the one the
+  // outbox broke. The table carries no FK to sessions, so the sessions DELETE never reached it, and
+  // UNIQUE(webhookId, idempotencyKey) then collided on every row until the all-or-nothing gate rolled
+  // the entire import back. Every other table's test clears first, which is why nothing caught it;
+  // this one deliberately does not.
+  it('restores webhook_outbox_events onto an instance that already holds them', async () => {
+    await seedSession('s1');
+    const outboxRepo = ds.getRepository(WebhookOutboxEvent);
+    await outboxRepo.save(
+      outboxRepo.create({
+        webhookId: 'wh-1',
+        sessionId: 's1',
+        event: 'message.received',
+        idempotencyKey: 'key-1',
+        deliveryId: 'del-1',
+        payload: { from: '628111@c.us' },
+        state: 'pending',
+        attempts: 0,
+      }),
+    );
+
+    const dump = await controller.exportData();
+    expect((dump.tables as unknown as { webhookOutboxEvents?: unknown[] }).webhookOutboxEvents).toHaveLength(1);
+
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(await outboxRepo.count()).toBe(1);
+    expect((await outboxRepo.findOneByOrFail({ idempotencyKey: 'key-1' })).state).toBe('pending');
   });
 
   // The messages import column list must carry every later-added column; `author` (the group
@@ -1440,10 +1478,12 @@ describe('InfraDataController audit trail — import emits only on a committed r
         Template,
         BaileysStoredMessage,
         LidMapping,
+        ChatState,
         PluginInstance,
         ConversationMapping,
         IngressEvent,
         WebhookDeliveryFailure,
+        WebhookOutboxEvent,
         IntegrationDeliveryFailure,
         StatusUpdate,
         AutomationRule,
@@ -1584,10 +1624,12 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
         Template,
         BaileysStoredMessage,
         LidMapping,
+        ChatState,
         PluginInstance,
         ConversationMapping,
         IngressEvent,
         WebhookDeliveryFailure,
+        WebhookOutboxEvent,
         IntegrationDeliveryFailure,
         StatusUpdate,
         AutomationRule,

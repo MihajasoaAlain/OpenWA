@@ -314,11 +314,10 @@ describe('MessageSendService', () => {
 
       await service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'hi' });
 
-      // SENT state merged onto the echo row; the redundant PENDING row dropped.
-      expect(repository.update).toHaveBeenCalledWith(
-        { sessionId: 'sess-1', waMessageId: 'wa-msg-1' },
-        expect.objectContaining({ status: MessageStatus.SENT }),
-      );
+      // Timestamp merged onto the echo row; the redundant PENDING row dropped. `status` is NOT
+      // written: the echo row is already SENT and an ack may have advanced it further.
+      const [, mergePatch] = (repository.update as jest.Mock).mock.calls[0] as [unknown, object];
+      expect(mergePatch).not.toHaveProperty('status');
       expect(repository.delete).toHaveBeenCalledWith({ id: 'msg-uuid-1' });
       const persisted = (hookManager.execute as jest.Mock).mock.calls.filter(
         ([ev]: unknown[]) => ev === 'message:persisted',
@@ -424,6 +423,33 @@ describe('MessageSendService', () => {
       });
 
       expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('test@c.us', 'Hi Alice {{unknown}}');
+    });
+
+    it('carries mentions and linkPreview from the template body through to the send', async () => {
+      // The rendered body is dispatched through sendText, so the two optionals it already honours
+      // reach the engine unchanged rather than being dropped at the template DTO.
+      (templateService.resolve as jest.Mock).mockResolvedValue(mockTemplate({ body: 'Hi @62811' }));
+
+      await service.sendTemplate('sess-1', {
+        chatId: 'group@g.us',
+        templateId: 'tpl-1',
+        mentions: ['62811@c.us'],
+        linkPreview: false,
+      });
+
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('group@g.us', 'Hi @62811', ['62811@c.us'], {
+        linkPreview: false,
+      });
+    });
+
+    it('leaves a plain template send on its two-argument call shape', async () => {
+      // Control for the case above: without either optional the call must not gain arguments, or
+      // every existing template send changes shape.
+      (templateService.resolve as jest.Mock).mockResolvedValue(mockTemplate({ body: 'Hi there' }));
+
+      await service.sendTemplate('sess-1', { chatId: 'test@c.us', templateId: 'tpl-1' });
+
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('test@c.us', 'Hi there');
     });
 
     it('should propagate NotFoundException when the template cannot be resolved', async () => {
@@ -925,6 +951,53 @@ describe('MessageSendService', () => {
 
       expect(mockEngine.replyToMessage).toHaveBeenCalledWith('test@c.us', 'wa-quoted-1', 'This is a reply');
     });
+
+    it('forwards the tag list to the engine, and keeps the untagged call three-argument', async () => {
+      await service.reply('sess-1', {
+        chatId: 'group@g.us',
+        quotedMessageId: 'wa-quoted-1',
+        text: 'hi @62811',
+        mentions: ['62811@c.us'],
+      });
+
+      expect(mockEngine.replyToMessage).toHaveBeenCalledWith('group@g.us', 'wa-quoted-1', 'hi @62811', ['62811@c.us']);
+
+      // Control: an empty list is not a tag request, so the call shape every existing reply makes is
+      // left untouched rather than gaining a trailing argument.
+      mockEngine.replyToMessage.mockClear();
+      await service.reply('sess-1', {
+        chatId: 'group@g.us',
+        quotedMessageId: 'wa-quoted-1',
+        text: 'plain',
+        mentions: [],
+      });
+      expect(mockEngine.replyToMessage).toHaveBeenCalledWith('group@g.us', 'wa-quoted-1', 'plain');
+    });
+
+    it('honours a plugin that rewrites the tag list, not the list the caller sent', async () => {
+      // message:sending is a moderation chokepoint. Reading the caller's own dto here instead of the
+      // gated result would send the unredacted tags while the hook reported success.
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: {
+          input: {
+            chatId: 'group@g.us',
+            quotedMessageId: 'wa-quoted-1',
+            text: 'hi @62811',
+            mentions: ['62811@c.us'],
+          },
+        },
+      });
+
+      await service.reply('sess-1', {
+        chatId: 'group@g.us',
+        quotedMessageId: 'wa-quoted-1',
+        text: 'hi @62811 @62999',
+        mentions: ['62811@c.us', '62999@c.us'],
+      });
+
+      expect(mockEngine.replyToMessage).toHaveBeenCalledWith('group@g.us', 'wa-quoted-1', 'hi @62811', ['62811@c.us']);
+    });
   });
 
   describe('forward', () => {
@@ -1079,11 +1152,12 @@ describe('MessageSendService', () => {
       expect(repository.update).toHaveBeenCalledWith(
         { sessionId: 'sess-1', waMessageId: 'wa-bulk-1' },
         expect.objectContaining({
-          status: MessageStatus.SENT,
           timestamp: 1706868000,
           metadata: bulkRow.metadata,
         }),
       );
+      const [, bulkPatch] = (repository.update as jest.Mock).mock.calls[0] as [unknown, object];
+      expect(bulkPatch).not.toHaveProperty('status');
       expect(saved).toEqual(expect.objectContaining({ id: 'echo-row' }));
     });
 
@@ -1147,8 +1221,18 @@ describe('MessageSendService', () => {
       expect(result.messageId).toBe('wa-msg-1'); // send reported success
       expect(repository.update).toHaveBeenCalledWith(
         { sessionId: 'sess-1', waMessageId: 'wa-msg-1' },
-        expect.objectContaining({ status: MessageStatus.SENT, timestamp: 1706868000 }),
+        expect.objectContaining({ timestamp: 1706868000 }),
       );
+      /**
+       * The delivery state is not in that patch, and that is the point.
+       *
+       * The row it merges onto is the own-send echo's, inserted SENT, and the ack path advances it
+       * forward-only. This merge could only ever write PENDING or SENT, so it was never an upgrade:
+       * when a `delivered` ack won the race, writing SENT here dragged the row back and the
+       * dashboard showed one tick for a message the recipient already had.
+       */
+      const [, sentPatch] = (repository.update as jest.Mock).mock.calls[0] as [unknown, object];
+      expect(sentPatch).not.toHaveProperty('status');
       expect(repository.delete).toHaveBeenCalledWith({ id: 'msg-uuid-1' });
     });
 

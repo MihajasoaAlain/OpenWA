@@ -17,6 +17,8 @@ import type {
   ChatSummary,
   DeleteChatRequest,
   MarkChatRequest,
+  MarkChatReadRequest,
+  SubscribePresenceRequest,
   ChatPresence,
   SendChatStateRequest,
   SuccessResult,
@@ -47,7 +49,7 @@ export class ChatsResource {
    * reconnect, so re-issue it when the session comes back. Subscribe per chat: WhatsApp emits an
    * update on every transition, so a broad subscription is a firehose. whatsapp-web.js answers 501.
    */
-  subscribePresence(sessionId: string, body: MarkChatRequest): Promise<SuccessResult> {
+  subscribePresence(sessionId: string, body: SubscribePresenceRequest): Promise<SuccessResult> {
     return this.client.request<SuccessResult>({
       method: 'POST',
       path: `/api/sessions/${encodeSegment(sessionId)}/presence/subscribe`,
@@ -67,7 +69,7 @@ export class ChatsResource {
   }
 
   /** Mark a chat as read/seen. */
-  markRead(sessionId: string, body: MarkChatRequest): Promise<SuccessResult> {
+  markRead(sessionId: string, body: MarkChatReadRequest): Promise<SuccessResult> {
     return this.client.request<SuccessResult>({
       method: 'POST',
       path: `/api/sessions/${encodeSegment(sessionId)}/chats/read`,

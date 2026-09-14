@@ -14,10 +14,16 @@ import { readWsRateLimitConfig } from '../modules/events/ws-rate-limit';
  * from an unrelated string. Deriving both from one value is what keeps a plugin's code and its
  * registry entry in the same tree.
  *
- * Deliberately NOT env-overridable: every other data path (DATABASE_NAME, MAIN_DATABASE_NAME,
+ * There is deliberately no DATA_DIR knob: every other data path (DATABASE_NAME, MAIN_DATABASE_NAME,
  * SESSION_DATA_PATH, BAILEYS_AUTH_DIR, STORAGE_LOCAL_PATH) carries its own override and none of them
- * would follow a DATA_DIR knob, so such a knob would move part of the state while looking like it
- * moved all of it.
+ * would follow it, so a knob by that name would move part of the state while looking like it moved
+ * all of it.
+ *
+ * PLUGIN_STATE_DIR is that objection answered rather than repeated: this value reaches exactly one
+ * consumer, PluginStorageService, so the knob is named for the registry and per-plugin storage it
+ * actually moves and claims nothing about the rest of the tree. Without it the plugin registry is
+ * the one piece of state a test lane cannot redirect, which is why every e2e suite in a run shares
+ * one registry file and rewrites the developer's copy of it.
  */
 export const DEFAULT_DATA_DIR = './data';
 
@@ -47,6 +53,15 @@ export function resolveNonNegativeIntEnv(raw: string | undefined, fallback: numb
 }
 
 /**
+ * Largest delay Node's timers accept. Above this a `setTimeout` overflows its 32-bit signed field,
+ * warns `TimeoutOverflowWarning`, and fires after 1 ms instead — so an operator reaching for an
+ * "effectively unlimited" budget by typing a row of nines gets the shortest possible one. Puppeteer
+ * arms `protocolTimeout` with a plain `setTimeout` (`common/CallbackRegistry.js`), so the ceiling
+ * applies to it directly and the browser never finishes launching.
+ */
+export const MAX_TIMER_MS = 2147483647;
+
+/**
  * The UI locale Chromium is pinned to. WhatsApp Web renders its chrome — including the new-account
  * onboarding modal the whatsapp-web.js adapter dismisses (#982) — in the browser's language, and that
  * detector matches visible English text. Without a pin the language is whatever the launched binary
@@ -74,7 +89,7 @@ export default () => ({
 
   // Root of the persistent state tree (see DEFAULT_DATA_DIR). Read by PluginStorageService for the
   // plugin registry and per-plugin storage; the other data paths keep their own env-specific keys.
-  dataDir: DEFAULT_DATA_DIR,
+  dataDir: process.env.PLUGIN_STATE_DIR || DEFAULT_DATA_DIR,
 
   // HTTP server timeouts (Node http.Server). Pinned explicitly so they are operator-tunable and
   // observable at boot rather than left at Node's implicit defaults. requestTimeout defaults to
@@ -205,6 +220,17 @@ export default () => ({
       // uses Puppeteer's bundled Chromium. Required on hosts where the bundled binary
       // is missing or incompatible (Alpine, ARM, custom base images).
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      // How long one CDP command may take. An account with thousands of chats can push a single
+      // `client.getChats()` past Puppeteer's own budget; raising this is the escape hatch. Left
+      // UNDEFINED rather than defaulted to Puppeteer's number, so an unset or out-of-range value
+      // means "whatever puppeteer-core's `timeout ?? 180_000` says" instead of pinning today's
+      // figure here and silently outliving it. Out of range is not clamped either: see
+      // wwebjs-lifecycle.ts for why a falsy value is not "no limit", and MAX_TIMER_MS above for
+      // why a huge one is not either.
+      protocolTimeoutMs: (() => {
+        const n = parseInt(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS || '', 10);
+        return Number.isFinite(n) && n > 0 && n <= MAX_TIMER_MS ? n : undefined;
+      })(),
     },
     sessionDataPath: process.env.SESSION_DATA_PATH || './data/sessions',
     // Baileys engine (used when ENGINE_TYPE=baileys). Multi-file auth state base dir; each session
@@ -435,8 +461,9 @@ export default () => ({
       return Number.isFinite(n) && n > 0 ? n : 20_000;
     })(),
     // Takeover sweep cadence (default 30s): how often a node looks for sessions whose holder's
-    // lease has lapsed — a crashed peer, or this node's own previous identity after a container
-    // recreate — and starts them here. Gated by the AUTO_START_SESSIONS feature flag.
+    // lease has lapsed (a crashed peer, or this node's own previous identity after a container
+    // recreate) and starts them here. Adopting follows the AUTO_START_SESSIONS feature flag; the
+    // sweep itself runs on every node and also marks a vanished node's leftover rows disconnected.
     takeoverSweepMs: (() => {
       const n = parseInt(process.env.SESSION_TAKEOVER_SWEEP_MS ?? '', 10);
       return Number.isFinite(n) && n > 0 ? n : 30_000;

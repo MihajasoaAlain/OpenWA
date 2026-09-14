@@ -1,4 +1,6 @@
 import * as path from 'path';
+import { ChatLabelsUnsupportedError } from '../../common/errors/chat-labels-unsupported.error';
+import { isChannelJid } from '../identity/wa-id';
 import type * as BaileysLib from '@whiskeysockets/baileys';
 import type { WASocket } from '@whiskeysockets/baileys';
 import { BaileysChannels } from './baileys-channels';
@@ -111,7 +113,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
   constructor(private readonly config: BaileysAdapterConfig) {
     // Isolate each session's auth state under its own subdirectory of the shared auth dir.
     this.authPath = path.join(config.authDir, config.sessionId);
-    this.sessionStore = new BaileysSessionStore(config.lidMappingStore, config.sessionId);
+    this.sessionStore = new BaileysSessionStore(config.lidMappingStore, config.sessionId, config.chatStateStore);
     // Constructed before messaging: the messaging delegate's own-send echo maps through
     // events.mapMessage (and the lifecycle delegate clears that same live-call cache on teardown).
     // One host literal for every delegate (the wwebjs-host pattern): a new cross-cutting member
@@ -151,6 +153,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
       toEngineJid: jid => this.sessionStore.toEngineJid(jid),
       getEphemeralExpiration: chatId => this.sessionStore.getEphemeralExpiration(chatId),
       getStoredMessage: messageId => this.config.messageStore?.getMessage(this.config.dbSessionId, messageId),
+      getStoredMessages: messageIds => this.config.messageStore?.getMessages(this.config.dbSessionId, messageIds),
       recordLidMapping: (lid, pn) =>
         this.sessionStore.addLidMappings([{ lid: `${lid.split('@')[0].split(':')[0]}@lid`, pn }]),
       mapMessage: (msg, contentType, opts) => this.events.mapMessage(msg, contentType, opts),
@@ -188,6 +191,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
       getOnQRCode: () => this.callbacks.onQRCode,
       getOnReady: () => this.callbacks.onReady,
       getOnDisconnected: () => this.callbacks.onDisconnected,
+      getOnReconnecting: () => this.callbacks.onReconnecting,
       getOnError: () => this.callbacks.onError,
       getOnStateChanged: () => this.callbacks.onStateChanged,
       getOnCredentialTeardownStarted: () => this.callbacks.onCredentialTeardownStarted,
@@ -314,8 +318,8 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return this.messaging.sendPollMessage(chatId, poll);
   }
 
-  async replyToMessage(chatId: string, quotedMsgId: string, text: string): Promise<MessageResult> {
-    return this.messaging.replyToMessage(chatId, quotedMsgId, text);
+  async replyToMessage(chatId: string, quotedMsgId: string, text: string, mentions?: string[]): Promise<MessageResult> {
+    return this.messaging.replyToMessage(chatId, quotedMsgId, text, mentions);
   }
 
   async forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult> {
@@ -342,8 +346,8 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return this.messaging.unpinMessage(chatId, messageId);
   }
 
-  async editMessage(chatId: string, messageId: string, body: string): Promise<MessageResult> {
-    return this.messaging.editMessage(chatId, messageId, body);
+  async editMessage(chatId: string, messageId: string, body: string, mentions?: string[]): Promise<MessageResult> {
+    return this.messaging.editMessage(chatId, messageId, body, mentions);
   }
 
   // ----- Groups -----
@@ -507,8 +511,8 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return this.messaging.subscribeToPresence(chatId);
   }
 
-  async sendSeen(chatId: string): Promise<boolean> {
-    return this.contacts.sendSeen(chatId);
+  async sendSeen(chatId: string, messageIds?: string[]): Promise<boolean> {
+    return this.contacts.sendSeen(chatId, messageIds);
   }
 
   async markUnread(chatId: string): Promise<boolean> {
@@ -580,8 +584,20 @@ export class BaileysAdapter implements IWhatsAppEngine {
   // Fold @c.us -> @s.whatsapp.net first: chatModify (which both calls wrap) keys the label
   // app-state index by the RAW jid, so a neutral @c.us would label a phantom chat the phone never
   // reads — reported as success. Same class of no-op the deleteForMe/star folds fixed.
+  /**
+   * Labels are a Business-account chat feature and WhatsApp has no concept of labelling a channel.
+   * whatsapp-web.js refuses a channel jid outright; this engine forwarded it and answered success
+   * while nothing was labelled, so the same request reported two different outcomes per engine.
+   */
+  private assertLabelable(chatId: string): void {
+    if (isChannelJid(chatId)) {
+      throw new ChatLabelsUnsupportedError('Channels do not support chat labels.');
+    }
+  }
+
   async addLabelToChat(chatId: string, labelId: string): Promise<void> {
     this.ensureReady();
+    this.assertLabelable(chatId);
     await withQueryDeadline(
       this.sock!.addChatLabel(this.sessionStore.toEngineJid(chatId), labelId),
       BAILEYS_QUERY_BUDGET_MS,
@@ -590,6 +606,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
   }
   async removeLabelFromChat(chatId: string, labelId: string): Promise<void> {
     this.ensureReady();
+    this.assertLabelable(chatId);
     await withQueryDeadline(
       this.sock!.removeChatLabel(this.sessionStore.toEngineJid(chatId), labelId),
       BAILEYS_QUERY_BUDGET_MS,

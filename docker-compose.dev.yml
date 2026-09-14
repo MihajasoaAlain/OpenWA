@@ -67,6 +67,7 @@ services:
       - SESSION_DATA_PATH=${SESSION_DATA_PATH:-/app/data/sessions}
       - PUPPETEER_HEADLESS=${PUPPETEER_HEADLESS:-true}
       - PUPPETEER_ARGS=${PUPPETEER_ARGS:---no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu}
+      - PUPPETEER_PROTOCOL_TIMEOUT_MS=${PUPPETEER_PROTOCOL_TIMEOUT_MS:-}
       # Optional WhatsApp Web version override. DEFAULT (empty, "latest", or "auto"): OpenWA auto-resolves a
       # settled build from the third-party wppconnect-team/wa-version registry and pins its remote HTML
       # (fetched into the web.whatsapp.com origin without an integrity check). Set "off" to disable pinning
@@ -83,6 +84,7 @@ services:
       # docker-compose.yml and the application default; set explicitly so the path stays correct even
       # if the volume moves.
       - PLUGINS_DIR=${PLUGINS_DIR:-/app/data/plugins}
+      - PLUGIN_STATE_DIR=${PLUGIN_STATE_DIR:-}
       # Plugin install-from-URL redirect policy (ssrf-guard): off unless the exact string 'true'.
       - PLUGIN_DOWNLOAD_ALLOW_INSECURE_REDIRECTS=${PLUGIN_DOWNLOAD_ALLOW_INSECURE_REDIRECTS:-false}
       - WEBHOOK_TIMEOUT=${WEBHOOK_TIMEOUT:-10000}
@@ -94,6 +96,7 @@ services:
       - WEBHOOK_CONTACT_DETAILS=${WEBHOOK_CONTACT_DETAILS:-}
       - BAILEYS_MARK_ONLINE_ON_CONNECT=${BAILEYS_MARK_ONLINE_ON_CONNECT:-}
       - BAILEYS_SYNC_FULL_HISTORY=${BAILEYS_SYNC_FULL_HISTORY:-}
+      - BAILEYS_WA_VERSION=${BAILEYS_WA_VERSION:-}
       - ALLOW_UNSIGNED_INGRESS=${ALLOW_UNSIGNED_INGRESS:-}
       - STORE_EPHEMERAL_MESSAGES=${STORE_EPHEMERAL_MESSAGES:-}
       - RESOLVE_LID_TO_PHONE=${RESOLVE_LID_TO_PHONE:-}
@@ -198,6 +201,7 @@ services:
       # Integration Fabric ingress: fairness, retries, retention, reconciler, workers.
       - INGRESS_INSTANCE_LIMIT=${INGRESS_INSTANCE_LIMIT:-}
       - INGRESS_INSTANCE_TTL=${INGRESS_INSTANCE_TTL:-}
+      - INGRESS_IP_LIMIT=${INGRESS_IP_LIMIT:-}
       - INGRESS_MAX_ATTEMPTS=${INGRESS_MAX_ATTEMPTS:-}
       - INGRESS_RETRY_DELAY_MS=${INGRESS_RETRY_DELAY_MS:-}
       - INGRESS_DEDUP_RETENTION_DAYS=${INGRESS_DEDUP_RETENTION_DAYS:-}
@@ -207,6 +211,11 @@ services:
       - INGRESS_RECONCILE_GRACE_MS=${INGRESS_RECONCILE_GRACE_MS:-}
       - INGRESS_RECONCILE_BATCH_SIZE=${INGRESS_RECONCILE_BATCH_SIZE:-}
       - INGRESS_RECONCILE_MAX_ATTEMPTS=${INGRESS_RECONCILE_MAX_ATTEMPTS:-}
+      - WEBHOOK_RECONCILE_INTERVAL_MS=${WEBHOOK_RECONCILE_INTERVAL_MS:-}
+      - WEBHOOK_RECONCILE_GRACE_MS=${WEBHOOK_RECONCILE_GRACE_MS:-}
+      - WEBHOOK_RECONCILE_BATCH_SIZE=${WEBHOOK_RECONCILE_BATCH_SIZE:-}
+      - WEBHOOK_RECONCILE_MAX_ATTEMPTS=${WEBHOOK_RECONCILE_MAX_ATTEMPTS:-}
+      - WEBHOOK_OUTBOX_RETENTION_DAYS=${WEBHOOK_OUTBOX_RETENTION_DAYS:-}
       - INGRESS_WORKER_CONCURRENCY=${INGRESS_WORKER_CONCURRENCY:-}
       # WebSocket gateway limits.
       - WS_RATE_LIMIT_FRAME_PER_SECOND=${WS_RATE_LIMIT_FRAME_PER_SECOND:-}

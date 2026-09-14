@@ -7,8 +7,10 @@ import { Queue } from 'bullmq';
 import * as crypto from 'crypto';
 import { setTimeout } from 'node:timers/promises';
 import { Webhook } from './entities/webhook.entity';
+import { WebhookOutboxService } from './webhook-outbox.service';
 import { WebhookDeliveryFailure } from './entities/webhook-delivery-failure.entity';
-import { recordWebhookDeliveryFailure, statusCodeFromError } from './utils/record-delivery-failure';
+import { recordWebhookDeliveryFailure } from './utils/record-delivery-failure';
+import { postWebhookPayload, recordTerminalFailure } from './utils/deliver-once';
 import { createLogger } from '../../common/services/logger.service';
 import { DEFAULT_WEBHOOK_MEDIA_INLINE_MAX_BYTES, shedInlineMedia } from '../../common/utils/inline-media';
 import { incrementWebhookDeliveryFailures } from '../../common/metrics/webhook-delivery-metrics';
@@ -16,7 +18,7 @@ import { QUEUE_NAMES } from '../queue/queue-names';
 import { generateIdempotencyKey, generateDeliveryId } from './utils/idempotency.util';
 import { evaluateFilters } from './filters/filter-evaluator';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
-import { withSafeFetch, isSsrfProtectionEnabled, redactSsrfError } from '../../common/security/ssrf-guard';
+import { redactSsrfError } from '../../common/security/ssrf-guard';
 import { HookManager } from '../../core/hooks';
 import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
 
@@ -58,6 +60,14 @@ const DEFAULT_WEBHOOK_MAX_PAYLOAD_BYTES = 1024 * 1024;
 const DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS = 5000;
 
 /** Per-event-occurrence context threaded through the dispatch pipeline stages (was closure state). */
+/**
+ * The result of one delivery attempt. Reported, not thrown: every failure below is already handled
+ * in place, so nothing reaches a caller as an exception and a try/catch cannot tell a delivered
+ * event from a dead-lettered one. 'cancelled' is a plugin suppressing the dispatch on purpose: it
+ * is terminal like 'delivered' and must never be replayed, but nothing left the process.
+ */
+export type WebhookDeliveryOutcome = 'delivered' | 'enqueued' | 'cancelled' | 'failed';
+
 interface DispatchEventContext {
   sessionId: string;
   event: string;
@@ -95,6 +105,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     private readonly failureRepository: Repository<WebhookDeliveryFailure>,
     private readonly configService: ConfigService,
     private readonly hookManager: HookManager,
+    private readonly outbox: WebhookOutboxService,
     @Optional()
     private readonly lidMappingStore?: LidMappingStoreService,
     @Optional()
@@ -245,7 +256,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
   ): Promise<void> {
     const { sessionId, event } = ctx;
     const lastError = redactSsrfError(error, this.logger, 'webhook dispatch');
-    await recordWebhookDeliveryFailure(this.failureRepository, this.logger, {
+    const recorded = await recordWebhookDeliveryFailure(this.failureRepository, this.logger, {
       webhookId: webhook.id,
       sessionId,
       event,
@@ -256,7 +267,9 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
       lastStatusCode: null,
       lastError,
     });
-    incrementWebhookDeliveryFailures();
+    if (recorded) {
+      incrementWebhookDeliveryFailures();
+    }
     try {
       await this.hookManager.execute(
         'webhook:error',
@@ -287,7 +300,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     deliveryId: string,
     idempotencyKey: string,
     ctx: DispatchEventContext,
-  ): Promise<{ finalPayload: WebhookPayload; body: string; headers: Record<string, string> } | null> {
+  ): Promise<{ finalPayload: WebhookPayload; body: string; headers: Record<string, string> } | 'cancelled' | null> {
     const { sessionId, event, baseData } = ctx;
     try {
       const payload: WebhookPayload = {
@@ -315,7 +328,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
           webhookId: webhook.id,
           action: 'webhook_cancelled_by_plugin',
         });
-        return null;
+        return 'cancelled';
       }
 
       // Null/undefined hook results mean "no override", matching an object without payload.
@@ -389,23 +402,38 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * What became of one delivery attempt, reported rather than thrown.
+   *
+   * Every failure path here is already handled in place (a dead-letter row, a hook, a log), so none
+   * of them reach the caller as an exception. The reconciler has to tell a delivered event from a
+   * dead-lettered one to know whether the outbox row may be retired, and a caught throw cannot tell
+   * it: there is none. This mirrors the inbound twin, where `ingressEnqueue.enqueue` returns an
+   * outcome and the caller retires the payload only when it is not 'failed'.
+   */
   private async deliverOne(
     webhook: Webhook,
     deliveryId: string,
     idempotencyKey: string,
     ctx: DispatchEventContext,
-  ): Promise<void> {
+  ): Promise<WebhookDeliveryOutcome> {
     const preflight = await this.preflightDelivery(webhook, deliveryId, idempotencyKey, ctx);
+    if (preflight === 'cancelled') {
+      // A plugin suppressed this dispatch deliberately. There is no failure to record and nothing
+      // to retry: reporting it as failed made the reconciler replay a deliberately dropped event
+      // until the budget ran out, then mark it lost against a failure row that never existed.
+      return 'cancelled';
+    }
     if (!preflight) {
-      return;
+      // The remaining bail-outs record their own undelivered row before returning null.
+      return 'failed';
     }
     const { finalPayload, body, headers } = preflight;
     // Use queue if available, otherwise fallback to direct delivery
     if (this.queueEnabled && this.webhookQueue) {
-      await this.enqueueWithFallback(webhook, finalPayload, body, headers, deliveryId, idempotencyKey, ctx);
-    } else {
-      await this.deliverDirect(webhook, finalPayload, body, headers, deliveryId, ctx);
+      return this.enqueueWithFallback(webhook, finalPayload, body, headers, deliveryId, idempotencyKey, ctx);
     }
+    return this.deliverDirect(webhook, finalPayload, body, headers, deliveryId, ctx);
   }
 
   private async enqueueWithFallback(
@@ -416,7 +444,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     deliveryId: string,
     idempotencyKey: string,
     ctx: DispatchEventContext,
-  ): Promise<void> {
+  ): Promise<WebhookDeliveryOutcome> {
     const { sessionId, event } = ctx;
     try {
       // Sign the exact pre-serialized body from preflight. The processor re-serializes the same
@@ -512,8 +540,13 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
           webhookId: webhook.id,
           action: 'webhook_queue_fallback_failed',
         });
+        return 'failed';
       }
+      // The queue never took it, but the fallback POST did.
+      return 'delivered';
     }
+    // Handed to BullMQ, which owns the retries and the dead-letter row from here.
+    return 'enqueued';
   }
 
   /** Direct delivery when the queue is disabled. */
@@ -524,7 +557,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     headers: Record<string, string>,
     deliveryId: string,
     ctx: DispatchEventContext,
-  ): Promise<void> {
+  ): Promise<WebhookDeliveryOutcome> {
     const { sessionId, event } = ctx;
     try {
       await this.deliverWebhook(webhook, finalPayload, headers, body);
@@ -554,7 +587,9 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
         webhookId: webhook.id,
         action: 'webhook_delivery_failed',
       });
+      return 'failed';
     }
+    return 'delivered';
   }
 
   /**
@@ -571,6 +606,16 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     const deliveryId = generateDeliveryId();
     // Salt per webhook so sibling subscriptions cannot collide at the receiver's dedup boundary.
     const idempotencyKey = `${baseIdempotencyKey}_${webhook.id}`;
+    // Durable record BEFORE anything is attempted. A hard crash from here until the delivery
+    // reaches a durable owner leaves this row 'pending', which is what the reconciler replays.
+    await this.outbox.open({
+      webhookId: webhook.id,
+      sessionId,
+      event,
+      idempotencyKey,
+      deliveryId,
+      payload: ctx.baseData,
+    });
     await this.dispatchLimiter
       .run(async () => {
         this.inFlightDeliveries.set(deliveryId, {
@@ -582,6 +627,9 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
         });
         try {
           await this.deliverOne(webhook, deliveryId, idempotencyKey, ctx);
+          // Reached a durable owner: handed to the queue, or completed inline. A failure inside
+          // either owner dead-letters through the failure row, so this is never replayed.
+          await this.outbox.close(webhook.id, idempotencyKey, 'dispatched');
         } finally {
           this.inFlightDeliveries.delete(deliveryId);
         }
@@ -623,6 +671,24 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Replay one recorded delivery, reusing its STORED idempotency key.
+   *
+   * Deriving a fresh key would defeat the point: the receiver dedups on that value, so a replay
+   * carrying a new one reads as a second event rather than a retry of the first. A new deliveryId
+   * IS issued, because that identifies the attempt rather than the event.
+   */
+  async redeliver(
+    webhook: Webhook,
+    sessionId: string,
+    event: string,
+    idempotencyKey: string,
+    data: Record<string, unknown>,
+  ): Promise<WebhookDeliveryOutcome> {
+    const deliveryId = generateDeliveryId();
+    return this.deliverOne(webhook, deliveryId, idempotencyKey, { sessionId, event, baseData: data });
+  }
+
+  /**
    * @deprecated Use job queue dispatch instead. This is kept for fallback.
    * `body` is the pre-serialized payload from preflight — the exact bytes the size gate checked and
    * (when a secret is set) the signature covers — so it is never re-serialized here.
@@ -643,21 +709,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
-      const { ok, status, statusText } = await withSafeFetch(
-        webhook.url,
-        {
-          method: 'POST',
-          headers,
-          body,
-          signal: AbortSignal.timeout(this.configService.get<number>('webhook.timeout', 10000)),
-        },
-        response => ({ ok: response.ok, status: response.status, statusText: response.statusText }),
-        { guard: isSsrfProtectionEnabled() },
-      );
-
-      if (!ok) {
-        throw new Error(`HTTP ${status}: ${statusText}`);
-      }
+      await postWebhookPayload(webhook.url, body, headers, this.configService.get<number>('webhook.timeout', 10000));
 
       // The receiver already answered 2xx — the delivery SUCCEEDED. A bookkeeping failure here (e.g.
       // the lastTriggeredAt update on a flaky DB) must not reach the catch below: it would retry an
@@ -695,8 +747,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
       }
       // All direct-path retries exhausted — persist a durable failure record before giving up, mirroring
       // the queued processor's final-attempt path so the queue-disabled path isn't a blind spot.
-      const errMessage = redactSsrfError(error);
-      await recordWebhookDeliveryFailure(this.failureRepository, this.logger, {
+      const recorded = await recordTerminalFailure(this.failureRepository, this.logger, {
         webhookId: webhook.id,
         sessionId: payload.sessionId,
         event: payload.event,
@@ -704,10 +755,11 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
         idempotencyKey: payload.idempotencyKey,
         deliveryId: payload.deliveryId,
         attempts: attempt,
-        lastStatusCode: statusCodeFromError(errMessage),
-        lastError: errMessage,
+        error,
       });
-      incrementWebhookDeliveryFailures();
+      if (recorded) {
+        incrementWebhookDeliveryFailures();
+      }
       throw error;
     }
   }

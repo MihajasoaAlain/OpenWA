@@ -18,6 +18,7 @@ import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import { fetch as undiciFetch } from 'undici';
 import { WebhookDeliveryService, WebhookPayload, WebhookJobData } from './webhook-delivery.service';
+import { WebhookOutboxService } from './webhook-outbox.service';
 import { Webhook } from './entities/webhook.entity';
 import { WebhookDeliveryFailure } from './entities/webhook-delivery-failure.entity';
 import { Session } from '../session/entities/session.entity';
@@ -56,6 +57,7 @@ describe('WebhookDeliveryService', () => {
   let hookManager: jest.Mocked<Partial<HookManager>>;
   let webhookQueue: jest.Mocked<Record<string, jest.Mock>>;
   let lidStore: { getCached: jest.Mock; resolveLid: jest.Mock };
+  let outboxService: { open: jest.Mock; close: jest.Mock };
 
   beforeEach(async () => {
     repository = {
@@ -63,8 +65,24 @@ describe('WebhookDeliveryService', () => {
       update: jest.fn().mockResolvedValue({ affected: 1 }),
     };
 
+    // Backed by the rows it accepts, not a constant: the dedupe guard reads count() before every
+    // insert, and a jest.fn() returning undefined would make the guard silently inert here while
+    // still passing every assertion.
+    const insertedFailures: Array<{ webhookId?: string; idempotencyKey?: string | null }> = [];
     failureRepository = {
-      insert: jest.fn().mockResolvedValue({}),
+      insert: jest.fn().mockImplementation((rowToInsert: { webhookId?: string; idempotencyKey?: string | null }) => {
+        insertedFailures.push(rowToInsert);
+        return Promise.resolve({});
+      }),
+      count: jest
+        .fn()
+        .mockImplementation((opts: { where: { webhookId?: string; idempotencyKey?: string } }) =>
+          Promise.resolve(
+            insertedFailures.filter(
+              r => r.webhookId === opts.where.webhookId && r.idempotencyKey === opts.where.idempotencyKey,
+            ).length,
+          ),
+        ),
       find: jest.fn().mockResolvedValue([]),
       delete: jest.fn().mockResolvedValue({ affected: 0 }),
     };
@@ -98,11 +116,14 @@ describe('WebhookDeliveryService', () => {
       resolveLid: jest.fn((jid: string) => (lidStore.getCached(userPart(jid)) as string | null | undefined) ?? null),
     };
 
+    outboxService = { open: jest.fn().mockResolvedValue(undefined), close: jest.fn().mockResolvedValue(undefined) };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         WebhookDeliveryService,
         { provide: getRepositoryToken(Webhook, 'data'), useValue: repository },
         { provide: getRepositoryToken(WebhookDeliveryFailure, 'data'), useValue: failureRepository },
+        { provide: WebhookOutboxService, useValue: outboxService },
         { provide: ConfigService, useValue: configService },
         { provide: HookManager, useValue: hookManager },
         { provide: LidMappingStoreService, useValue: lidStore },
@@ -174,6 +195,25 @@ describe('WebhookDeliveryService', () => {
       (repository.find as jest.Mock).mockRejectedValue(new Error('db down'));
       await expect(service.dispatch('sess-1', 'message.received', { x: 1 })).resolves.toBeUndefined();
       expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('records the delivery before attempting it, and retires the record once it lands', async () => {
+      const webhook = createMockWebhook({ events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([webhook]);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.dispatch('sess-1', 'message.received', { from: '628123456789@c.us' });
+
+      // Durability is only worth anything if the row exists BEFORE the attempt: a crash during the
+      // POST is exactly the window this closes.
+      expect(outboxService.open).toHaveBeenCalledTimes(1);
+      const opened = (outboxService.open.mock.calls as unknown as Record<string, unknown>[][])[0][0];
+      expect(opened).toMatchObject({ webhookId: webhook.id, sessionId: 'sess-1', event: 'message.received' });
+      expect(opened.idempotencyKey).toEqual(expect.stringContaining(webhook.id));
+      expect(outboxService.open.mock.invocationCallOrder[0]).toBeLessThan(mockFetch.mock.invocationCallOrder[0]);
+
+      // Retired once a durable owner has it, so the reconciler never replays a delivered event.
+      expect(outboxService.close).toHaveBeenCalledWith(webhook.id, opened.idempotencyKey, 'dispatched');
     });
 
     it('should dispatch to webhooks matching the event', async () => {
@@ -582,6 +622,75 @@ describe('WebhookDeliveryService', () => {
       expect(getWebhookDeliveryFailuresTotal()).toBe(failuresBefore);
       expect(hookManager.execute).toHaveBeenCalledWith('webhook:delivered', expect.anything(), expect.anything());
       expect(hookManager.execute).not.toHaveBeenCalledWith('webhook:error', expect.anything(), expect.anything());
+    });
+
+    // The reconciler branches on this VALUE, never on a throw: every failing path inside redeliver
+    // dead-letters in place, so nothing reaches the caller as an exception. When this reported
+    // nothing, a replay that never delivered was retired 'dispatched' on the first sweep and the
+    // documented WEBHOOK_RECONCILE_MAX_ATTEMPTS budget was unreachable.
+    it('redeliver reports failed when the receiver never accepts, and delivered when it does', async () => {
+      const webhook = createMockWebhook({ events: ['message.received'], retryCount: 1 });
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValue(new Error('receiver down'));
+      await expect(
+        service.redeliver(webhook, 'sess-1', 'message.received', 'stored-key-1', { from: 'x@c.us' }),
+      ).resolves.toBe('failed');
+
+      // Control: the same call on a receiver that answers 2xx must NOT report 'failed', otherwise
+      // the assertion above is satisfied by a method that reports failure unconditionally.
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue({ ok: true, status: 200 });
+      await expect(
+        service.redeliver(webhook, 'sess-1', 'message.received', 'stored-key-2', { from: 'x@c.us' }),
+      ).resolves.toBe('delivered');
+    });
+
+    it('reports a plugin-cancelled dispatch as cancelled, recording no failure and sending nothing', async () => {
+      // A before-hook that stops the dispatch is a deliberate drop. Reported as 'failed' it looked
+      // identical to a lost delivery, so the reconciler replayed it once per sweep until the budget
+      // ran out and then marked it terminally lost against a failure row nothing ever wrote.
+      const webhook = createMockWebhook({ events: ['message.received'], retryCount: 1 });
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: false, data: {} });
+      const failuresBefore = getWebhookDeliveryFailuresTotal();
+      mockFetch.mockReset();
+
+      await expect(
+        service.redeliver(webhook, 'sess-1', 'message.received', 'cancelled-key', { from: 'x@c.us' }),
+      ).resolves.toBe('cancelled');
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(failureRepository.insert).not.toHaveBeenCalled();
+      expect(getWebhookDeliveryFailuresTotal()).toBe(failuresBefore);
+    });
+
+    it('records one failure row per lost delivery however many times the reconciler replays it', async () => {
+      // The reconciler leaves a failed row pending and sweeps it again until the attempt budget is
+      // spent. Every replay reaching the dead-letter table turned one lost event into as many rows
+      // and as many increments of the loss metric as the budget allowed.
+      const webhook = createMockWebhook({ events: ['message.received'], retryCount: 1 });
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValue(new Error('receiver down'));
+      const failuresBefore = getWebhookDeliveryFailuresTotal();
+
+      for (let sweep = 0; sweep < 3; sweep++) {
+        await expect(
+          service.redeliver(webhook, 'sess-1', 'message.received', 'stranded-key', { from: 'x@c.us' }),
+        ).resolves.toBe('failed');
+      }
+
+      expect(failureRepository.insert).toHaveBeenCalledTimes(1);
+      expect(getWebhookDeliveryFailuresTotal()).toBe(failuresBefore + 1);
+
+      // Control: a genuinely different delivery must still be recorded, or the assertion above is
+      // satisfied by a guard that suppresses every row after the first.
+      await expect(
+        service.redeliver(webhook, 'sess-1', 'message.received', 'other-key', { from: 'x@c.us' }),
+      ).resolves.toBe('failed');
+      expect(failureRepository.insert).toHaveBeenCalledTimes(2);
+      expect(getWebhookDeliveryFailuresTotal()).toBe(failuresBefore + 2);
     });
 
     it("isolates each webhook's data so an in-place before-hook mutation cannot bleed across webhooks", async () => {
@@ -1140,6 +1249,8 @@ describe('WebhookDeliveryService', () => {
           WebhookDeliveryService,
           { provide: getRepositoryToken(Webhook, 'data'), useValue: repository },
           { provide: getRepositoryToken(WebhookDeliveryFailure, 'data'), useValue: failureRepository },
+          { provide: WebhookOutboxService, useValue: outboxService },
+          { provide: WebhookOutboxService, useValue: outboxService },
           { provide: ConfigService, useValue: { get: jest.fn().mockImplementation(configGet) } },
           { provide: HookManager, useValue: hookManager },
           { provide: getQueueToken(QUEUE_NAMES.WEBHOOK), useValue: webhookQueue },

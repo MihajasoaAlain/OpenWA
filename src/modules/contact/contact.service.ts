@@ -1,8 +1,9 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { HttpException, BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { EngineRegistry } from '../../engine/engine-registry.service';
+import { createLogger } from '../../common/services/logger.service';
 import { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 import { paginate, ListOptions } from '../../common/utils/paginate';
-import { isIndividualWid, parseWaId } from '../../engine/identity/wa-id';
+import { isIndividualWid, parseWaId, toNeutralJid } from '../../engine/identity/wa-id';
 
 /**
  * Owns engine access for contact operations so the "session not started" guard and
@@ -10,6 +11,8 @@ import { isIndividualWid, parseWaId } from '../../engine/identity/wa-id';
  */
 @Injectable()
 export class ContactService {
+  private readonly logger = createLogger('ContactService');
+
   constructor(private readonly engines: EngineRegistry) {}
 
   private getEngine(sessionId: string): IWhatsAppEngine {
@@ -47,15 +50,23 @@ export class ContactService {
   }
 
   /**
-   * The HTTP route promises null when the engine cannot map the id (docs/06 and the ApiResponse
-   * text), and that includes "the lookup itself failed": a dead page, an evaluation error or a
-   * rate limit answers 200 null, not a 5xx. The ENGINE method rejects on those (the lid resolver
-   * needs the distinction), so swallow here at the boundary.
+   * The HTTP route promises null when the LOOKUP cannot produce an answer (docs/06 and the
+   * ApiResponse text): a dead page, an evaluation error or a rate limit answers 200 null, not a
+   * 5xx. The ENGINE method rejects on those (the lid resolver needs the distinction), so genuine
+   * lookup failures are swallowed here at the boundary - logged at debug, since the old adapter
+   * catch was the only place these were visible. Deliberate HTTP answers (400 not-started, 409
+   * not-ready) propagate: nulling them would tell a retrying caller "no mapping" for a session
+   * that simply is not running.
    */
   async resolveContactPhone(sessionId: string, contactId: string): Promise<string | null> {
+    const engine = this.getEngine(sessionId);
     try {
-      return await this.getEngine(sessionId).resolveContactPhone(contactId);
-    } catch {
+      return await engine.resolveContactPhone(contactId);
+    } catch (error) {
+      if (error instanceof HttpException) throw error;
+      this.logger.debug(`resolveContactPhone lookup failed for ${contactId}`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
       return null;
     }
   }
@@ -114,15 +125,34 @@ export class ContactService {
   }
 
   /**
-   * Guarded like the addressbook writes: whatsapp-web.js's Contact.block()/unblock() silently
-   * return false for a group id (nothing blocked, reported as success), and Baileys passes the id
-   * to updateBlockStatus, whose Boom for an unresolvable jid has no HttpException mapping (opaque
-   * 500). A group/newsletter/lid id does not name a person, so refuse it here on both engines
-   * with the same 400 the addressbook surfaces use.
+   * Guarded because whatsapp-web.js's Contact.block()/unblock() silently return false for a group id
+   * (nothing blocked, reported as success), and Baileys passes the id to updateBlockStatus, whose
+   * Boom for an unresolvable jid has no HttpException mapping (opaque 500). See `assertBlockable`
+   * for why this guard is wider than the addressbook one.
    */
   blockContact(sessionId: string, contactId: string) {
-    this.assertAddressable(contactId);
+    this.assertBlockable(contactId);
     return this.getEngine(sessionId).blockContact(this.toAddressableId(contactId));
+  }
+
+  /**
+   * Blocking acts on an IDENTITY, not on an addressbook row, so unlike the addressbook writes it
+   * accepts a privacy id (`@lid`) as well as a phone-based one. It has to: a privacy-id contact has
+   * no phone number, and the blocklist READ answers ids verbatim (Baileys maps each blocked jid
+   * through `toNeutralJid`, which leaves an unresolved lid as `<lid>@lid`; whatsapp-web.js returns
+   * the wid as-is), so refusing them made the very ids this API hands out unusable for the matching
+   * write and left such a contact listed as blocked with no way to unblock it.
+   *
+   * Neither engine needs a phone here: Baileys passes the jid straight to `updateBlockStatus`, and
+   * whatsapp-web.js only short-circuits (`Contact.block()` returns false without acting) for a
+   * group. What must still be refused is an id that names no individual at all, which is what made
+   * whatsapp-web.js answer 200 "blocked" while nothing was blocked.
+   */
+  private assertBlockable(contactId: string): void {
+    if (isIndividualWid(contactId) || this.isBareNumber(contactId)) return;
+    throw new BadRequestException(
+      `Contact ${contactId} does not name an individual; block and unblock act on a person, so pass a phone-based or privacy (@lid) contact id instead`,
+    );
   }
 
   /**
@@ -170,7 +200,12 @@ export class ContactService {
    * qualification is a no-op there.
    */
   private toAddressableId(contactId: string): string {
-    return this.isBareNumber(contactId) ? `${contactId.trim()}@c.us` : contactId;
+    const trimmed = contactId.trim();
+    // Neutralized rather than passed through: a Meta-hosted id names the same account as its plain
+    // twin but whatsapp-web.js knows no such domain, so forwarding the suffix verbatim would fail
+    // inside the page instead of acting on the person. toNeutralJid is idempotent on ids already in
+    // the neutral dialect, and the Baileys adapter re-encodes to its own dialect on the way out.
+    return this.isBareNumber(trimmed) ? `${trimmed}@c.us` : toNeutralJid(trimmed);
   }
 
   upsertContact(sessionId: string, contactId: string, firstName: string, lastName?: string) {
@@ -184,7 +219,7 @@ export class ContactService {
   }
 
   unblockContact(sessionId: string, contactId: string) {
-    this.assertAddressable(contactId);
+    this.assertBlockable(contactId);
     return this.getEngine(sessionId).unblockContact(this.toAddressableId(contactId));
   }
 }

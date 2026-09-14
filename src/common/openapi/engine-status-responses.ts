@@ -23,6 +23,27 @@ export const ENGINE_NOT_READY_409 =
   'into it — for those few seconds the answer is a `409` naming the reload; retry shortly.';
 
 /**
+ * `EngineNotReadyError` (409) on `POST /sessions/:sessionId/pairing-code`, where the generic wording
+ * above points the caller at the wrong state: both engines accept a pairing request only while the
+ * session is `qr_ready`, and a session that reads `ready` is already linked and answers `400`.
+ *
+ * `qr_ready` is necessary but not sufficient on Baileys, hence the closing-socket sentence: the guard
+ * also tests `ws.isOpen`, and the status trails the transport because Baileys emits its close only
+ * after `await ws.close()` resolves. Same shape as the reload window ENGINE_NOT_READY_409 names, and
+ * for the same reason: a caller that treats the documented status as sufficient would otherwise read
+ * a legitimate retryable 409 as a bad state.
+ */
+export const PAIRING_NOT_READY_409 =
+  'The session is not waiting to be linked: the engine is still connecting, or reconnecting after a ' +
+  'drop, so the request never reached WhatsApp. Wait for `status` to read `qr_ready` and retry. Once a ' +
+  'code has been accepted the session moves through `authenticating` and `initializing` to `ready` and ' +
+  'answers this until then; wait for `ready` in that case. A session that reads `ready` is already ' +
+  'linked and answers `400` instead. One window answers this while the session still reads ' +
+  '`qr_ready`: on the Baileys engine a socket that has begun closing stops accepting a pairing ' +
+  'request before the status catches up, which on a silently dropped connection takes until the ' +
+  "WebSocket's close timeout (30 s); retry, and the status follows shortly.";
+
+/**
  * The catalog and status services pass a `NotFoundException` factory to `EngineRegistry.require()`
  * instead of taking its `BadRequestException` default, so on those routes an unstarted session is a
  * 404 rather than the 400 every other engine module answers. Documented rather than changed: the
@@ -98,3 +119,19 @@ export const ENGINE_NOT_SUPPORTED_501 =
 export const CHANNEL_MEDIA_501 =
   'Sending media to a channel (`<id>@newsletter`) is not supported by the whatsapp-web.js engine — ' +
   'the page method it needs was removed by a WhatsApp Web update. Text to a channel still works.';
+
+/**
+ * `PayloadTooLargeException` (413), thrown by `assertBase64WithinMediaCap` when an outbound base64
+ * payload's DECODED size exceeds the shared media byte cap, before the payload is persisted or handed
+ * to an engine.
+ *
+ * Declared as a constant for the same reason as the rest of this file: the cap belongs to the media
+ * path, not to any one route, and it already reaches nine call sites. It was answered by every media
+ * send long before it was declared on any of them, which is how a caller reading only the contract
+ * came to expect a `400` the code never sends.
+ */
+export const MEDIA_TOO_LARGE_413 =
+  'The decoded base64 media exceeds the media byte cap (`MEDIA_DOWNLOAD_MAX_BYTES`, 50 MiB by ' +
+  'default). A whole request is separately bounded by `BODY_SIZE_LIMIT` (25 mb by default), and ' +
+  'base64 inflates by about a third, so a large send usually meets that coarser limit first: the ' +
+  'body parser rejects the request before this check runs.';

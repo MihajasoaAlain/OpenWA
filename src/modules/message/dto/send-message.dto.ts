@@ -16,8 +16,26 @@ import { Type } from 'class-transformer';
 import { IsMentionWidConstraint } from './is-mention-wid.validator';
 import { ToStrictBoolean } from '../../../common/utils/strict-boolean';
 
-const MENTIONS_DESCRIPTION =
+export const MENTIONS_DESCRIPTION =
   'WIDs to @mention (e.g. ["62811@c.us"]). The text/caption must also contain the @<number> token.';
+
+/**
+ * Caps for a `mentions` array, exported because the field appears on every REST route whose engine
+ * can carry it (send, reply, edit, template, bulk) and on the matching agent-tool schemas. Inline
+ * literals repeated per site is how the two numbers would drift apart between endpoints that share
+ * one documented contract, and the tool path needs them most: it calls the service directly, so the
+ * ValidationPipe never runs and the zod schema is the only cap there is.
+ */
+export const MENTIONS_MAX = 1024;
+export const MENTION_WID_MAX_LENGTH = 64;
+
+/**
+ * Caps for a custom link preview, exported for the same reason as the mentions pair above: the
+ * agent-tool schema restates nothing, and that path never reaches the ValidationPipe.
+ */
+export const CUSTOM_PREVIEW_URL_MAX_LENGTH = 2048;
+export const CUSTOM_PREVIEW_TITLE_MAX_LENGTH = 256;
+export const CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH = 1024;
 
 // Single source of truth for the text-body cap, shared with the agent-tool input schemas
 // (src/core/agent-tools/tools/message.tools.ts) so MCP and REST enforce the same limit.
@@ -42,7 +60,7 @@ export class CustomLinkPreviewDto {
   })
   @IsString()
   @IsNotEmpty()
-  @MaxLength(2048)
+  @MaxLength(CUSTOM_PREVIEW_URL_MAX_LENGTH)
   url!: string;
 
   @ApiProperty({
@@ -52,13 +70,13 @@ export class CustomLinkPreviewDto {
   })
   @IsString()
   @IsNotEmpty()
-  @MaxLength(256)
+  @MaxLength(CUSTOM_PREVIEW_TITLE_MAX_LENGTH)
   title!: string;
 
   @ApiPropertyOptional({ description: 'Preview description', example: 'Read the announcement.', maxLength: 1024 })
   @IsOptional()
   @IsString()
-  @MaxLength(1024)
+  @MaxLength(CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH)
   description?: string;
 }
 
@@ -84,9 +102,9 @@ export class SendTextMessageDto {
   @ApiPropertyOptional({ description: MENTIONS_DESCRIPTION, example: ['628123456789@c.us'], type: [String] })
   @IsOptional()
   @IsArray()
-  @ArrayMaxSize(1024)
+  @ArrayMaxSize(MENTIONS_MAX)
   @IsString({ each: true })
-  @MaxLength(64, { each: true })
+  @MaxLength(MENTION_WID_MAX_LENGTH, { each: true })
   @Validate(IsMentionWidConstraint, { each: true })
   mentions?: string[];
 
@@ -212,9 +230,9 @@ export class SendMediaMessageDto {
   @ApiPropertyOptional({ description: MENTIONS_DESCRIPTION, example: ['628123456789@c.us'], type: [String] })
   @IsOptional()
   @IsArray()
-  @ArrayMaxSize(1024)
+  @ArrayMaxSize(MENTIONS_MAX)
   @IsString({ each: true })
-  @MaxLength(64, { each: true })
+  @MaxLength(MENTION_WID_MAX_LENGTH, { each: true })
   @Validate(IsMentionWidConstraint, { each: true })
   mentions?: string[];
 

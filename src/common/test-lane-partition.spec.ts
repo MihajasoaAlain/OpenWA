@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -12,8 +12,8 @@ import { join } from 'node:path';
 describe('Test lane partition', () => {
   const repoRoot = join(__dirname, '..', '..');
   const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
-    scripts: { 'test:docs'?: string };
-    jest?: { testPathIgnorePatterns?: string[] };
+    scripts: { 'test:docs'?: string; 'test:scripts'?: string };
+    jest?: { testPathIgnorePatterns?: string[]; coveragePathIgnorePatterns?: string[] };
   };
 
   /** Every spec path the `test:docs` script names as a positional, however the flags are ordered. */
@@ -49,6 +49,64 @@ describe('Test lane partition', () => {
           `Only in testPathIgnorePatterns: ${onlyInIgnored.join(', ') || '(none)'}.`,
       );
     }
+  });
+
+  /**
+   * `coveragePathIgnorePatterns` exists to keep the doc-lint suites out of the coverage
+   * DENOMINATORS: excluded from the unit lane, they would otherwise be counted as source files with
+   * 0% coverage and drag every floor down. So it has to mirror the ignore list, and it has to
+   * contain nothing else.
+   *
+   * The second half is the one that bites. Adding a real source path here removes that code from
+   * every ratio silently: the floors keep passing, on a smaller denominator, and coverage that
+   * never existed reads as coverage that does. The commit that introduced the array said it was
+   * "enforced by the lane-partition spec"; it never was, and this is that enforcement.
+   */
+  it('keeps the coverage ignore list a mirror of the test ignore list, and nothing more', () => {
+    const testIgnores = pkg.jest?.testPathIgnorePatterns ?? [];
+    const coverageIgnores = pkg.jest?.coveragePathIgnorePatterns ?? [];
+
+    // Vacuity guard: two empty arrays are trivially equal.
+    expect(coverageIgnores.length).toBeGreaterThan(20);
+
+    const testSet = new Set(testIgnores);
+    const coverageSet = new Set(coverageIgnores);
+    expect({
+      onlyInCoverage: [...coverageSet].filter(p => !testSet.has(p)),
+      onlyInTest: [...testSet].filter(p => !coverageSet.has(p)),
+    }).toEqual({ onlyInCoverage: [], onlyInTest: [] });
+
+    // A pattern that is neither `/node_modules/` nor a single spec file is a source path, and a
+    // source path here deletes that code from the coverage ratios.
+    const notASpec = coverageIgnores.filter(p => p !== '/node_modules/' && !p.endsWith('\\.spec\\.ts$'));
+    expect(notASpec).toEqual([]);
+  });
+
+  /**
+   * `scripts/` has its own lane. `test:scripts` hands node:test an explicit list of positionals,
+   * and jest never looks in that directory, so the two lanes cannot cover for each other: a spec
+   * written under `scripts/` and left out of that string runs NOWHERE, and nothing fails to say so.
+   *
+   * Unlike the doc lane above there is no second list to compare against, so the comparison is
+   * against the directory itself. That also catches the reverse, a renamed or deleted spec still
+   * named by the script, which makes the whole node:test invocation exit non-zero on a file it
+   * cannot open.
+   */
+  it('runs every spec under scripts/ in the test:scripts lane', () => {
+    const isSpec = (name: string): boolean => name.endsWith('.spec.js') || name.endsWith('.spec.mjs');
+    const onDisk = readdirSync(join(repoRoot, 'scripts'))
+      .filter(isSpec)
+      .map(name => `scripts/${name}`);
+    const named = (pkg.scripts['test:scripts'] ?? '').split(/\s+/).filter(isSpec);
+
+    // Vacuity guard: an empty directory scan or an unparsed script would pass the diff below.
+    expect(onDisk.length).toBeGreaterThan(10);
+    expect(named.length).toBeGreaterThan(10);
+
+    expect({
+      neverRun: onDisk.filter(path => !named.includes(path)).sort(),
+      namedButAbsent: named.filter(path => !onDisk.includes(path)).sort(),
+    }).toEqual({ neverRun: [], namedButAbsent: [] });
   });
 
   it('names suites that exist on disk', () => {

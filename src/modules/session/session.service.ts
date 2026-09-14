@@ -1,4 +1,5 @@
 import {
+  HttpException,
   Injectable,
   NotFoundException,
   ConflictException,
@@ -10,11 +11,19 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
-import { Repository, In, Not, IsNull, DataSource, FindManyOptions } from 'typeorm';
+import { Repository, In, Not, IsNull, LessThan, DataSource, FindManyOptions } from 'typeorm';
 import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { setTimeout } from 'node:timers/promises';
+import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { Session, SessionStatus } from './entities/session.entity';
-import { CreateSessionDto, SessionConfigResponseDto, UpdateSessionConfigDto } from './dto';
+import {
+  CreateSessionDto,
+  SessionConfigResponseDto,
+  UpdateSessionConfigDto,
+  SessionProxyResponseDto,
+  UpdateSessionProxyDto,
+  projectSessionProxy,
+} from './dto';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { SessionLivenessWatchdog } from './session-liveness-watchdog.service';
 import { SessionErrorStore } from './session-error-store.service';
@@ -28,9 +37,61 @@ import { resolveFeatureFlags } from '../../config/feature-flags';
 import { IWhatsAppEngine, ChatSummary, ChatState } from '../../engine/interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
 import { HookManager } from '../../core/hooks';
+// Type-only: the module binds this class to PLUGIN_SESSION_PORT with a `useExisting` alias, which
+// TypeScript does not check, so `implements` is what keeps the two in step.
+import type { PluginSessionPort } from '../../core/plugins/plugin-host-ports';
+
+/** Stagger before the single transient-launch retry; short - the claim is held while it waits. */
+const SESSION_START_RETRY_DELAY_MS = 2_000;
+
+/**
+ * Driver codes meaning "locked, try again", not "your query is wrong".
+ *
+ * These are unreachable through the message regex below, which is why the code is read separately.
+ * better-sqlite3 reports lock contention as `code: 'SQLITE_BUSY'` with the message `database is
+ * locked`, and TypeORM's QueryFailedError copies the driver's own properties onto itself while
+ * rewriting the message to `SqliteError: database is locked`. So the code survives the wrap and the
+ * token never appears in any message: matching `SQLITE_BUSY` as text could not fire on either shape.
+ */
+const TRANSIENT_DB_CODES = new Set(['SQLITE_BUSY', 'SQLITE_LOCKED']);
+
+/**
+ * A launch failure worth one retry: infrastructure said "not now" (a 5xx, a transport death, a
+ * database error while persisting status), not the session or the caller being refused. HTTP 4xx
+ * and the documented 409 not-ready are deliberate answers, and a lost-claim ConflictException is a
+ * real conflict.
+ */
+function isTransientLaunchFailure(error: unknown): boolean {
+  // EngineTransportError (503) is the one mapped HTTP shape that means infrastructure died
+  // mid-launch (dead page/socket at initialize). Every OTHER HttpException is a deliberate
+  // answer: the 409 not-ready family reflects session state, the 504 auth-timeout family
+  // reflects the account/proxy, and a 4xx is a refusal. The explicit early-exit (not a message
+  // regex relying on the 504 texts never containing 'connection') pins that intent.
+  if (error instanceof EngineTransportError) return true;
+  if (error instanceof HttpException) return false;
+  // TypeORM QueryFailedError and driver errors carry no HttpException shape.
+  if (!(error instanceof Error)) return false;
+  const code: unknown = (error as { code?: unknown }).code;
+  if (typeof code === 'string' && TRANSIENT_DB_CODES.has(code)) return true;
+  return /connection|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|terminating connection/i.test(error.message);
+}
 
 /** Pause between sequential auto-start launches so a burst of Chromium boots does not spike the host. */
 export const AUTOSTART_THROTTLE_MS = 2_000;
+
+/**
+ * Statuses that assert an engine is running somewhere. The boot reset clears them for every row this
+ * node may claim; markLapsedDisconnected clears them for a row whose holder never came back, a
+ * QR_READY row only while it has no phone. FAILED and CREATED stay out of both: an operator has to
+ * see them.
+ */
+const ACTIVE_STATUSES = [
+  SessionStatus.READY,
+  SessionStatus.INITIALIZING,
+  SessionStatus.QR_READY,
+  SessionStatus.AUTHENTICATING,
+  SessionStatus.ACTION_REQUIRED,
+];
 
 /**
  * The session-record API: CRUD over the sessions table, aggregate stats, and the thin engine query
@@ -41,7 +102,7 @@ export const AUTOSTART_THROTTLE_MS = 2_000;
  * its public surface toward the controller and the feature modules is unchanged by the split.
  */
 @Injectable()
-export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicationBootstrap {
+export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicationBootstrap, PluginSessionPort {
   private readonly logger = createLogger('SessionService');
 
   // Live engine instances, owned by the shared EngineRegistry (the narrow port feature modules
@@ -87,17 +148,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * serving traffic. A row held by another node with an unexpired lease is therefore left alone.
    */
   async onModuleInit(): Promise<void> {
-    const activeStatuses = [
-      SessionStatus.READY,
-      SessionStatus.INITIALIZING,
-      SessionStatus.QR_READY,
-      SessionStatus.AUTHENTICATING,
-      SessionStatus.ACTION_REQUIRED,
-    ];
-
     const claimable = this.ownership?.claimableWhere() ?? [{}];
     const result = await this.sessionRepository.update(
-      claimable.map(clause => ({ ...clause, status: In(activeStatuses) })),
+      claimable.map(clause => ({ ...clause, status: In(ACTIVE_STATUSES) })),
       { status: SessionStatus.DISCONNECTED },
     );
 
@@ -269,7 +322,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // allowlist) lists all — mirroring the ApiKeyGuard allowedSessions model so a scoped key
     // cannot enumerate every session through this aggregate route.
     const { limit, offset } = resolveListWindow(opts.limit, opts.offset);
-    const options: FindManyOptions<Session> = { order: { createdAt: 'DESC' }, take: limit, skip: offset };
+    // `id` tiebreaks the second-resolution `createdAt` so a paged walk has a total order.
+    const options: FindManyOptions<Session> = {
+      order: { createdAt: 'DESC', id: 'DESC' },
+      take: limit,
+      skip: offset,
+    };
     if (allowedSessions && allowedSessions.length > 0) {
       options.where = { id: In(allowedSessions) };
     }
@@ -350,6 +408,31 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return this.projectConfig(config);
   }
 
+  async getProxy(id: string): Promise<SessionProxyResponseDto> {
+    const session = await this.findOne(id);
+    return projectSessionProxy(session);
+  }
+
+  /**
+   * Persist per-session proxy settings. No engine restart — proxy is read at initializeEngine() on
+   * the next start(), matching the reconnect settings on PATCH /config.
+   */
+  async updateProxy(id: string, dto: UpdateSessionProxyDto): Promise<SessionProxyResponseDto> {
+    const session = await this.findOne(id);
+
+    if (dto.proxyUrl === null) {
+      await this.sessionRepository.update(id, { proxyUrl: null, proxyType: null });
+      return projectSessionProxy({ proxyUrl: null });
+    }
+
+    if (dto.proxyUrl !== undefined) {
+      await this.sessionRepository.update(id, { proxyUrl: dto.proxyUrl, proxyType: null });
+      return projectSessionProxy({ proxyUrl: dto.proxyUrl });
+    }
+
+    return projectSessionProxy(session);
+  }
+
   /** Record removal + engine retirement + credential purge: owned by the lifecycle service. */
   async delete(id: string): Promise<void> {
     // Set the tearing-down mark SYNCHRONOUSLY, before the ownership fence's awaited query. The
@@ -408,7 +491,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       throw new ConflictException(`Session ${id} is running on another node`);
     }
     try {
-      return await this.engineLifecycle.start(id);
+      return await this.startWithTransientRetry(id);
     } catch (error) {
       // A failed or refused start must not leave the claim pinned here — the heartbeat would renew
       // it and the session could never be started anywhere else. Released only when nothing is
@@ -416,6 +499,39 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // runs the engine, and releasing then would invite a peer to open a second connection.
       await this.releaseUnlessEngineActive(id);
       throw error;
+    }
+  }
+
+  /**
+   * One bounded retry for a TRANSIENT launch failure (a database hiccup while persisting the
+   * initial status, a transport blip while the adapter boots). A transient failure during adopt or
+   * boot auto-start used to release the claim and end the story: nothing ever retried, so the
+   * session stayed down until some process restarted. The retry keeps the claim held (the outer
+   * catch only runs when this gives up), and re-claims it if the retry window outlived the lease -
+   * a lapsed claim must not turn the retry into a 409.
+   *
+   * Bounded to one retry on a short stagger: a persistent failure is a real fault, and an
+   * unbounded loop here would hold the concurrency slot hostage. HTTP-shaped refusals (409
+   * not-ready, 4xx) are NOT transient - they propagate immediately.
+   */
+  private async startWithTransientRetry(id: string): Promise<Session> {
+    try {
+      return await this.engineLifecycle.start(id);
+    } catch (error) {
+      if (!isTransientLaunchFailure(error)) throw error;
+      this.logger.warn(`Transient launch failure for session ${id}; retrying once`, {
+        sessionId: id,
+        action: 'session_start_transient_retry',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await setTimeout(SESSION_START_RETRY_DELAY_MS);
+      // The lease may have lapsed while the first attempt ran; the retry must keep holding the
+      // claim, never 409 on the session it already owns.
+      if (this.ownership && !(await this.ownership.claim(id))) {
+        await this.findOne(id);
+        throw new ConflictException(`Session ${id} is running on another node`);
+      }
+      return this.engineLifecycle.start(id);
     }
   }
 
@@ -594,11 +710,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return this.presence.get(id, chatId);
   }
 
-  async sendSeen(id: string, chatId: string): Promise<boolean> {
+  async sendSeen(id: string, chatId: string, messageIds?: string[]): Promise<boolean> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.sendSeen(chatId);
+    return engine.sendSeen(chatId, messageIds);
   }
 
   async markUnread(id: string, chatId: string): Promise<boolean> {
@@ -744,5 +860,78 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     sessionIds: string[],
   ): Promise<{ stopped: string[]; notRunning: string[]; failed: string[] }> {
     return this.engineLifecycle.stopOrphanEngines(sessionIds);
+  }
+
+  /**
+   * Mark disconnected every session a vanished node left in a running status.
+   *
+   * A lapsed claim means no process hosts that engine any more: a crashed peer, or this container's
+   * own previous identity after a recreate (the default nodeId is the hostname, which a recreate
+   * changes). The boot reset cannot touch those rows because it is fenced to what this node may
+   * claim, and a row still naming a foreign node on an unexpired lease is not one of them, so
+   * without this the row goes on reporting READY for an engine nobody runs. The claim itself is
+   * deliberately left in place, so the row stays the adoptable orphan the takeover sweep looks for.
+   *
+   * `goneBefore` is the caller's "really gone" cutoff, not simply now: a lease lapses while its
+   * holder is perfectly healthy whenever a query runs long, and the next heartbeat re-extends it.
+   * Acting on a single lapse would report a live peer's sessions as disconnected, and nothing would
+   * correct it, because that peer's renewal still finds its own nodeId and detects no loss. The cutoff
+   * narrows that case without closing it: a holder cut off from the database for longer than the
+   * cutoff is marked too, and does not write its status back once it reconnects.
+   */
+  async markLapsedDisconnected(sessions: Session[], goneBefore: Date): Promise<string[]> {
+    const marked: string[] = [];
+    for (const session of sessions) {
+      if (!ACTIVE_STATUSES.includes(session.status)) continue;
+      // A correction must never change what the takeover sweep adopts. It adopts every other active
+      // status anyway: AUTHENTICATING and ACTION_REQUIRED claim a running engine too, and whatever a
+      // human was asked to do lived in the engine that died with its node. It never adopts a row
+      // without a phone, but it does adopt a DISCONNECTED row with one, so rewriting a QR_READY row
+      // that has a phone would launch an engine that only renders a QR nobody asked for. QR_READY is
+      // therefore corrected only without a phone, re-checked in the write below in case a pairing
+      // completes in between.
+      const unlinkedOnly = session.status === SessionStatus.QR_READY;
+      if (unlinkedOnly && session.phone != null) continue;
+      // Both are guaranteed non-null by the lapsed-claim query that produced these rows, and both are
+      // load-bearing in the predicate below. TypeORM throws on a null or undefined where value, so a
+      // null here would fail this row's write instead of matching on it.
+      if (session.nodeId == null) continue;
+      if (session.leaseExpiresAt == null || session.leaseExpiresAt >= goneBefore) continue;
+      // Written on the same predicate the read used, never by id alone: a peer, or this node's own
+      // adopt loop, can claim and start this row at any moment, and a claim rewrites `nodeId`, so a
+      // row that was taken matches nothing here and keeps the status its start gave it.
+      let affected: number | undefined;
+      try {
+        ({ affected } = await this.sessionRepository.update(
+          {
+            id: session.id,
+            nodeId: session.nodeId,
+            leaseExpiresAt: LessThan(goneBefore),
+            status: session.status,
+            ...(unlinkedOnly && { phone: IsNull() }),
+          },
+          { status: SessionStatus.DISCONNECTED },
+        ));
+      } catch (error) {
+        // One row's failed write must not strand the rows after it. The next sweep retries this one.
+        this.logger.warn(`Failed to correct the status session ${session.name} was left in`, {
+          sessionId: session.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+      if (!affected) continue;
+      this.logger.warn(`Session ${session.name} was left ${session.status} by a node that never came back`, {
+        sessionId: session.id,
+        action: 'lapsed_claim_reset',
+        fromNode: session.nodeId,
+      });
+      // Fan-out only. The row is already written above, under the predicate that makes it safe;
+      // going back through updateStatus would re-write it by id and could land on a row a peer has
+      // since claimed and started.
+      this.engineLifecycle.announceStatus(session.id, SessionStatus.DISCONNECTED);
+      marked.push(session.id);
+    }
+    return marked;
   }
 }

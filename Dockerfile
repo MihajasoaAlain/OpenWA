@@ -39,7 +39,10 @@ COPY scripts/postinstall.js ./scripts/
 # variable, so docker-compose.yml's `NODE_ENV=${NODE_ENV:-production}` leaks NODE_ENV=production
 # into this stage and a bare `npm ci` would skip @nestjs/cli → `sh: 1: nest: not found` (exit 127).
 # (docker-compose.dev.yml hardcodes NODE_ENV=development, which is why the dev build never hit this.)
-RUN npm ci --include=dev
+# This stage only builds dist/ and the dashboard SPA and never launches a browser; the production
+# stage downloads Chrome explicitly. Skip the Puppeteer postinstall download so @puppeteer/browsers 3
+# does not try to extract a zip here, where no archiver is installed.
+RUN PUPPETEER_SKIP_DOWNLOAD=true npm ci --include=dev
 
 # Copy source code
 COPY . .
@@ -65,11 +68,12 @@ FROM docker.io/node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc
 # changes nothing about which dependencies land in the image.
 ENV NODE_ENV=production
 
-# Chrome for Testing has no linux-arm64 build, and Puppeteer's chromium snapshot
-# is x86_64-only on Linux too. So: amd64 uses Chrome for Testing (downloaded below)
-# to avoid the Debian chromium package's K8s SIGTRAP under strict non-root/seccomp;
-# arm64 installs Debian's chromium instead (it ships a native arm64 build). Both
-# resolve to the same /usr/local/bin/puppeteer-chrome symlink below.
+# amd64 uses Chrome for Testing (downloaded below) to avoid the Debian chromium
+# package's K8s SIGTRAP under strict non-root/seccomp. arm64 installs Debian's
+# chromium instead, by choice: it ships a native arm64 build, Chrome for Testing
+# publishes linux-arm64 builds only from 153 on, and Puppeteer's chromium snapshot
+# is x86_64-only on Linux. Both resolve to the same /usr/local/bin/puppeteer-chrome
+# symlink below.
 #
 # chromium-sandbox is listed EXPLICITLY (not left to Recommends) so --no-install-recommends still
 # trims every other Recommends but keeps the setuid sandbox binary available. Our default forces
@@ -78,7 +82,8 @@ ENV NODE_ENV=production
 # with --no-install-recommends the package is dropped, and chromium launches fine under --no-sandbox.
 ARG TARGETARCH
 # sqlite3 ships the CLI so an in-container scripts/backup.sh run takes online-consistent SQLite
-# snapshots (.backup) instead of plain-copying a live database (which can archive a torn file).
+# snapshots (.backup) instead of plain-copying a live database (which can archive a torn file). The
+# DATABASE_TYPE=postgres half of the same script needs pg_dump, installed further down.
 #
 # ffmpeg backs the opt-in media-conversion endpoints, and also repairs an existing gap: whatsapp-web.js
 # requires fluent-ffmpeg at module load and calls it for video-to-webp animated stickers, so
@@ -86,7 +91,12 @@ ARG TARGETARCH
 # cost with --no-install-recommends: ~210 MB, and no new fixable CRITICAL/HIGH findings under the
 # release image scan. It is the Debian package rather than a bundled static build precisely so that
 # codec CVEs arrive through the same security stream as everything else here.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# `apt-get upgrade` runs first because the base is pinned by digest: the Debian packages it ships
+# (libpcre2, libc, openssl and the rest) keep that snapshot's versions, and `apt-get install` upgrades
+# only the packages it names. A bookworm-security fix published after the snapshot reaches them here,
+# and the release workflow rebuilds this layer without cache so the fix is actually picked up.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     $([ "$TARGETARCH" = arm64 ] && echo "chromium chromium-sandbox") \
     fonts-liberation \
     libappindicator3-1 \
@@ -109,9 +119,52 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     patch \
     curl \
+    unzip \
     procps \
     sqlite3 \
     ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# The PostgreSQL client for the DATABASE_TYPE=postgres half of backup.sh/restore.sh, which the
+# runbook drives in-container. Debian bookworm ships client 15 and pg_dump refuses a newer server
+# outright ("aborting because of server version mismatch", reproduced against the postgres:16 the
+# bundled compose file runs), so the distro package would install a pg_dump that cannot dump our own
+# stack, and psql would be missing for restore. PGDG is PostgreSQL's own apt repository and carries
+# current majors for both architectures we build; measured cost ~59 MB.
+#
+# Deliberately NEWER than the postgres:16 the compose file ships. The rule is one-directional (a
+# client may be newer than its server, never older), and DATABASE_HOST often points at a managed
+# Postgres the compose file does not control, where 17 is the current default. Pinning to 16 would
+# have left every such deployment unable to back up. Verified against live 16 and 17 servers.
+#
+# The signing key is committed rather than fetched at build time. Fetched, it was the one build input
+# nothing pinned: `signed-by` attests only that the .debs match whatever that request returned, so a
+# compromised host, or a build behind a TLS-intercepting proxy whose root is in the trust store,
+# would swap the trust anchor with nothing to notice. Committed, it is reviewed once and diffable
+# forever, and it removes one of the two network calls the release build makes uncached
+# (release.yml's `no-cache-filters: production` rebuilds this stage every tag, on both platforms).
+# Verify with `gpg --show-keys --with-fingerprint scripts/pgdg-ACCC4CF8.asc`:
+#   B97B0AFC AA1A47F0 44F244A0 7FCC7D46 ACCC4CF8, uid "PostgreSQL Debian Repository".
+#
+# 10 packages arrive with it on top of the list above (12 on a bare base; sqlite3 already brings
+# libreadline8), including a full perl interpreter: /usr/bin/pg_dump is a symlink to
+# postgresql-common's pg_wrapper, which is a perl script. Trivy on the built image, with the release
+# job's own settings (CRITICAL,HIGH + ignore-unfixed + .trivyignore): 0 findings, the bar the ffmpeg
+# layer above was held to. Counting unfixed ones too, the perl packages carry 8 CRITICAL/HIGH with
+# no upstream fix, but every one of them is a CVE the base image ALREADY had through perl-base
+# (Debian essential, present before this layer), so the layer adds 0 distinct vulnerabilities.
+# libpq5 and the postgresql-client packages themselves are clean. Recheck with:
+#   trivy image --vuln-type os,library --severity CRITICAL,HIGH --ignore-unfixed --ignorefile .trivyignore <image>
+#
+# The armored key must reach the image with LF endings. apt dearmors a `signed-by=` .asc through
+# apt-key, whose awk advances on the blank armor separator line, so a CR there yields an empty
+# keyring and NO_PUBKEY 7FCC7D46ACCC4CF8. The `.gitattributes` rule keeps fresh clones on LF; the
+# strip below repairs the Windows clones already on disk, which that rule cannot reach.
+COPY scripts/pgdg-ACCC4CF8.asc /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+RUN sed -i 's/\r$//' /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get install -y --no-install-recommends postgresql-client-17 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Puppeteer to skip automatic download during npm install (we download it explicitly below)
@@ -131,7 +184,7 @@ COPY package*.json ./
 # scripts/postinstall.js rides along so a bare local `npm ci` keeps working, but the
 # --ignore-scripts install below skips the hook here: the explicit fatal run right
 # after is the sole (and stricter) applier for the image.
-COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js ./scripts/
+COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-wwebjs-block.js scripts/patch-wwebjs-group-description.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js ./scripts/
 
 # Install production dependencies only, then apply the backports. The status patcher runs after
 # the two patchers it depends on: its transforms were written against the tree they leave behind.
@@ -153,6 +206,8 @@ RUN npm ci --omit=dev --ignore-scripts \
     && node scripts/patch-wwebjs-status.js \
     && node scripts/patch-wwebjs-ready-sync.js \
     && node scripts/patch-wwebjs-participant-arity.js \
+    && node scripts/patch-wwebjs-block.js \
+    && node scripts/patch-wwebjs-group-description.js \
     && node scripts/patch-baileys-appstate.js \
     && node scripts/patch-baileys-newsletter-create.js \
     && npm cache clean --force
@@ -168,13 +223,25 @@ RUN npm ci --omit=dev --ignore-scripts \
 RUN npm install -g npm@12.0.2 && npm cache clean --force
 
 # amd64: download Chrome for Testing via Puppeteer and symlink it.
-# arm64: use Debian's chromium installed above (CfT has no linux-arm64 build).
+# arm64: use Debian's chromium installed above (a choice; see the note at that install).
 # test -n guards against a future path mismatch failing loudly instead of shipping a broken image.
+#
+# The CfT version is pinned so a rebuild installs the same browser. Nothing bumps it for us:
+# dependabot does not read this line, and the image scans cannot see the binary (no dpkg package owns
+# /opt/puppeteer), so a stale browser never fails a scan. To bump it, take the Stable version from
+# https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json, confirm it has
+# a linux64 chrome download in known-good-versions-with-downloads.json, and update the docs that
+# repeat this command (scripts/dockerfile-patchers.spec.js fails until they match). It may be newer
+# than the revision puppeteer-core pins; the arm64 image already runs whatever chromium Debian ships.
+# On an amd64 build, check that a session paired under the old browser still reconnects and that a
+# new whatsapp-web.js session reaches its QR code. A new major cannot be rolled back without
+# restoring sessions/ (an older Chrome deletes the IndexedDB a newer one opened), so give the bump a
+# CHANGELOG upgrade note.
 RUN if [ "$TARGETARCH" = arm64 ]; then \
         ln -s /usr/bin/chromium /usr/local/bin/puppeteer-chrome; \
     else \
         mkdir -p /opt/puppeteer && \
-        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@146.0.7680.31' && \
+        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@153.0.8010.36' && \
         chown -R openwa:openwa /opt/puppeteer && \
         chrome_path=$(find /opt/puppeteer/chrome/linux*/chrome-linux64/chrome | head -n 1) && \
         test -n "$chrome_path" && \

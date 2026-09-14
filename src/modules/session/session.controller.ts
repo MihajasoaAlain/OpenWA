@@ -18,9 +18,12 @@ import {
   CreateSessionDto,
   SessionConfigResponseDto,
   UpdateSessionConfigDto,
+  SessionProxyResponseDto,
+  UpdateSessionProxyDto,
   SessionResponseDto,
   QRCodeResponseDto,
   MarkChatReadDto,
+  MarkChatUnreadDto,
   SubscribePresenceDto,
   SetOwnPresenceDto,
   ChatPresenceResponseDto,
@@ -42,7 +45,7 @@ import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { RequireRole, CurrentApiKey, SessionScoped, RequireUnscopedKey } from '../auth/decorators/auth.decorators';
 import { ApiKey, ApiKeyRole } from '../auth/entities/api-key.entity';
-import { ENGINE_NOT_READY_409 } from '../../common/openapi/engine-status-responses';
+import { ENGINE_NOT_READY_409, PAIRING_NOT_READY_409 } from '../../common/openapi/engine-status-responses';
 
 @ApiTags('sessions')
 @Controller('sessions')
@@ -163,6 +166,52 @@ export class SessionController {
       metadata: { ...config },
     });
     return config;
+  }
+
+  @Get(':sessionId/proxy')
+  @ApiOperation({ summary: 'Get the per-session egress proxy configuration (credentials masked)' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({
+    status: 200,
+    description: 'Effective proxy configuration',
+    type: SessionProxyResponseDto,
+  })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async getProxy(@Param('sessionId', ParseUUIDPipe) id: string): Promise<SessionProxyResponseDto> {
+    return this.sessionService.getProxy(id);
+  }
+
+  @Patch(':sessionId/proxy')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  // Routing a session's whole egress through an attacker-chosen host is an instance-level decision,
+  // not a per-session one. Before this route existed, `proxyUrl` could only be set through POST
+  // /sessions, which is unscoped by the fence above, so a key restricted to specific sessions could
+  // never configure a proxy. Keep that reachability rather than widening it as a side effect.
+  @RequireUnscopedKey()
+  @ApiOperation({
+    summary: 'Update the per-session egress proxy configuration',
+    description:
+      'Sets or clears the proxy URL. Credentials in `proxyUrl` are stored but never returned by GET. ' +
+      'No restart is performed — changes apply on the next session start.',
+  })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({
+    status: 200,
+    description: 'Updated proxy configuration',
+    type: SessionProxyResponseDto,
+  })
+  @ApiResponse({ status: 400, description: 'Invalid proxyUrl' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async updateProxy(
+    @Param('sessionId', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateSessionProxyDto,
+  ): Promise<SessionProxyResponseDto> {
+    const proxy = await this.sessionService.updateProxy(id, dto);
+    await this.auditService.logInfo(AuditAction.SESSION_CONFIG_UPDATED, {
+      sessionId: id,
+      metadata: { proxyEnabled: proxy.enabled, proxyType: proxy.proxyType, proxyHost: proxy.proxyHost },
+    });
+    return proxy;
   }
 
   @Delete(':sessionId')
@@ -359,7 +408,6 @@ export class SessionController {
     description: 'QR code not ready or session already authenticated',
   })
   @ApiResponse({ status: 404, description: 'Session not found' })
-  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async getQRCode(@Param('sessionId', ParseUUIDPipe) id: string): Promise<QRCodeResponseDto> {
     const qrCode = await this.sessionService.getQRCode(id);
     await this.auditService.logInfo(AuditAction.SESSION_QR_GENERATED, {
@@ -375,7 +423,7 @@ export class SessionController {
   @ApiResponse({ status: 201, description: 'Pairing code generated', type: PairingCodeResponseDto })
   @ApiResponse({ status: 400, description: 'Session not started or already authenticated' })
   @ApiResponse({ status: 404, description: 'Session not found' })
-  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({ status: 409, description: PAIRING_NOT_READY_409 })
   async requestPairingCode(
     @Param('sessionId', ParseUUIDPipe) id: string,
     @Body() dto: RequestPairingCodeDto,
@@ -447,7 +495,15 @@ export class SessionController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Mark a chat as read/seen' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
-  @ApiResponse({ status: 200, description: 'Chat marked as read successfully', type: SessionActionResponseDto })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Returns `{ success }`. `false` means the engine declined to act: the Baileys engine sends the ' +
+      "read receipt against the chat's last known message, so a chat it has seen no message in is " +
+      'reported as declined rather than marked read. The whatsapp-web.js engine reads the chat from ' +
+      'the page and needs no local history.',
+    type: SessionActionResponseDto,
+  })
   @ApiResponse({ status: 400, description: 'Session not ready' })
   @ApiResponse({ status: 404, description: 'Session not found' })
   @ApiResponse({
@@ -461,7 +517,7 @@ export class SessionController {
     @Param('sessionId', ParseUUIDPipe) id: string,
     @Body() dto: MarkChatReadDto,
   ): Promise<{ success: boolean }> {
-    const success = await this.sessionService.sendSeen(id, dto.chatId);
+    const success = await this.sessionService.sendSeen(id, dto.chatId, dto.messageIds);
     return { success };
   }
 
@@ -564,7 +620,7 @@ export class SessionController {
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async markChatUnread(
     @Param('sessionId', ParseUUIDPipe) id: string,
-    @Body() dto: MarkChatReadDto,
+    @Body() dto: MarkChatUnreadDto,
   ): Promise<{ success: boolean }> {
     const success = await this.sessionService.markUnread(id, dto.chatId);
     return { success };
@@ -642,7 +698,13 @@ export class SessionController {
       'history mutes like any other.',
     type: SessionActionResponseDto,
   })
-  @ApiResponse({ status: 400, description: 'Session not ready, or an invalid chatId / muteUntil' })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Session not ready, an invalid chatId / muteUntil, or a chatId the whatsapp-web.js engine ' +
+      'cannot resolve. The Baileys engine writes the mute without resolving the chat first and ' +
+      'answers `success: true` for a chat that does not exist.',
+  })
   @ApiResponse({ status: 404, description: 'Session not found' })
   @ApiResponse({
     status: 503,

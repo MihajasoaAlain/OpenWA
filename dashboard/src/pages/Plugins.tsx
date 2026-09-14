@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { localizePlugin } from '../utils/localizePlugin';
 import { configUiSafeConfig, missingRequiredConfig, sparseSessionOverride } from '../utils/pluginConfigRules';
@@ -65,23 +65,37 @@ function ConfigField({
   onChange: (next: unknown) => void;
 }) {
   const { t } = useTranslation();
+  // Per-instance id: ConfigField renders once per schema property (and recurses), so a hardcoded
+  // id would collide on any schema with two boolean fields - the second label would toggle the
+  // first checkbox. useId is stable across re-renders and unique per instance.
+  const fieldId = React.useId();
   const desc = field.description ? <small>{field.description}</small> : null;
+  // Bound to the control it names. The boolean branch below builds its own pair because its caption
+  // and its checkbox sit in different containers.
   const labelEl = (
-    <label>
+    <label htmlFor={fieldId}>
       {label}
       {field.required && <span className="required-mark"> *</span>}
     </label>
+  );
+  // An array renders one control PER ROW, so there is no single input for a label to point at; a
+  // `<label>` here would be an orphan that names nothing. It is a caption, so it is marked up as one.
+  const captionEl = (
+    <span className="config-array-label">
+      {label}
+      {field.required && <span className="required-mark"> *</span>}
+    </span>
   );
 
   if (field.type === 'boolean') {
     return (
       <div className="form-group toggle-group">
         <div className="toggle-info">
-          <label>{label}</label>
+          <label htmlFor={fieldId}>{label}</label>
           {desc}
         </div>
         <label className="toggle-switch">
-          <input type="checkbox" checked={Boolean(value)} onChange={e => onChange(e.target.checked)} />
+          <input id={fieldId} type="checkbox" checked={Boolean(value)} onChange={e => onChange(e.target.checked)} />
           <span className="toggle-slider"></span>
         </label>
       </div>
@@ -94,6 +108,7 @@ function ConfigField({
       <div className="form-group">
         {labelEl}
         <select
+          id={fieldId}
           value={String(value ?? '')}
           // Restore the option's original type (e.g. a number/boolean enum), not the raw string value.
           onChange={e => onChange(options.find(o => String(o) === e.target.value) ?? e.target.value)}
@@ -137,14 +152,14 @@ function ConfigField({
       // that would stringify the array to "[object Object]"/"" and corrupt it).
       return (
         <div className="config-array">
-          {labelEl}
+          {captionEl}
           {desc}
         </div>
       );
     }
     return (
       <div className="config-array">
-        {labelEl}
+        {captionEl}
         {desc}
         {rows.map((row, i) => (
           <div className="config-array-row" key={i}>
@@ -179,6 +194,7 @@ function ConfigField({
       <div className="form-group">
         {labelEl}
         <textarea
+          id={fieldId}
           value={value === undefined || value === null ? '' : String(value)}
           placeholder={field.default !== undefined ? String(field.default) : undefined}
           required={field.required}
@@ -197,6 +213,7 @@ function ConfigField({
     <div className="form-group">
       {labelEl}
       <input
+        id={fieldId}
         type={inputType}
         value={value === undefined || value === null ? '' : String(value)}
         placeholder={field.default !== undefined ? String(field.default) : undefined}
@@ -488,7 +505,14 @@ function SessionsTab({ plugin }: { plugin: Plugin }) {
         <section className="sessions-section">
           <h3>{t('plugins.sessions.perSessionTitle')}</h3>
           <small>{t('plugins.sessions.perSessionDesc')}</small>
-          <select className="sessions-select" value={selSession} onChange={e => setSelSession(e.target.value)}>
+          {/* The heading above is a sibling, not a label, so the select had no accessible name of its
+              own: a screen reader announced an unnamed combobox. */}
+          <select
+            className="sessions-select"
+            aria-label={t('plugins.sessions.selectSession')}
+            value={selSession}
+            onChange={e => setSelSession(e.target.value)}
+          >
             <option value="">{t('plugins.sessions.selectSession')}</option>
             {sessions.map(s => (
               <option key={s.id} value={s.id}>

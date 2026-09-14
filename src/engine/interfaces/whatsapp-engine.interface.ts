@@ -78,6 +78,10 @@ export type MessageType =
   | 'poll'
   | 'call'
   | 'revoked'
+  // WhatsApp Business commerce: a customer's cart placed from the catalog, and a single product
+  // card shared into a chat. Both carry the ids the commerce APIs need — see `IncomingMessage`.
+  | 'order'
+  | 'product'
   // A message WhatsApp deliberately withheld from linked/companion devices (e.g. high-security
   // business OTPs): the payload is absent by design, not unparseable. See `mapBaileysMessageType`.
   | 'masked'
@@ -111,6 +115,28 @@ export interface IncomingMessage {
   /** Set for `call` (call_log) messages: video vs voice, and whether an incoming call went unanswered. */
   call?: { video: boolean; missed: boolean };
   /**
+   * Set for `order` messages: a cart the customer placed from the business catalog. The message
+   * carries no line items — `orderId` plus the single-order `token` are the correlation handle a
+   * caller redeems against WhatsApp's own order lookup, which this project does not expose, so both
+   * must survive to that caller. Both engines populate them.
+   */
+  order?: {
+    orderId: string;
+    /** Opaque, single-order credential. Pass through unchanged; do not log it. */
+    token?: string;
+  };
+  /**
+   * Set for `product` messages: the catalog product shared into the chat. `productId` identifies it
+   * within `businessOwnerJid`'s catalog, so it resolves through the catalog routes only when that
+   * catalog is the session's own. Both engines populate `productId`; the rest are best-effort.
+   */
+  product?: {
+    productId: string;
+    title?: string;
+    description?: string;
+    businessOwnerJid?: string;
+  };
+  /**
    * Set by the adapter when the sender is identified by a privacy id (e.g. a WhatsApp `@lid`) rather
    * than a phone number, so engine-neutral code can decide whether to attempt phone resolution without
    * matching an engine-specific JID scheme.
@@ -132,7 +158,7 @@ export interface IncomingMessage {
     mimetype: string;
     filename?: string;
     data?: string; // base64; absent when the payload was omitted (see `omitted`)
-    /** True when the media blob was dropped due to a size cap, timeout, or concurrency saturation. */
+    /** True when the media blob was dropped: a size cap, a timeout, a disabled download, or a failed one. */
     omitted?: boolean;
     /** Decoded byte size of the media; always set when `omitted` is true. */
     sizeBytes?: number;
@@ -491,6 +517,25 @@ export interface ChatSummary {
   unreadCount: number;
   timestamp: number;
   lastMessage?: string;
+  /** Archived state, as set via `POST /sessions/{sessionId}/chats/archive`. */
+  archived: boolean;
+  /** Pinned state, as set via `POST /sessions/{sessionId}/chats/pin`. */
+  pinned: boolean;
+  /**
+   * Muted state, as set via `POST /sessions/{sessionId}/chats/mute`. The verdict a caller needs to
+   * label a mute/unmute control: whatsapp-web.js derives `Chat.isMuted` itself, and Baileys compares
+   * a persisted `muteEndTime` (epoch milliseconds) against now. `muteExpiration` carries the instant.
+   */
+  muted: boolean;
+  /**
+   * Epoch MILLISECONDS at which the mute ends, present only when `muted` is true; `0` means muted
+   * indefinitely. Milliseconds is the same unit as `POST /sessions/{sessionId}/chats/mute`
+   * `muteUntil`, so a FINITE value can be written straight back (`mute-chat.dto.ts` documents that
+   * unit and why a seconds value is a trap). The `0` an indefinite mute reports is the exception:
+   * `muteUntil` requires a real future instant, so re-apply an indefinite mute with a far-future
+   * timestamp rather than `0`.
+   */
+  muteExpiration?: number;
 }
 
 /**
@@ -739,6 +784,25 @@ export interface EngineEventCallbacks {
    */
   onHistoryMessages?: (messages: IncomingMessage[]) => void;
   onDisconnected?: (reason: string) => void;
+  /**
+   * Fired each time the engine schedules an INTERNAL reconnect attempt: a drop it retries on its own
+   * and deliberately does NOT report through `onDisconnected`, because the session is still linked and
+   * the credentials are still good. Purely informational, so a consumer must not tear anything down on
+   * it; the engine keeps owning the retry.
+   *
+   * `attempt` is the 1-based number of the attempt being scheduled, and it resets once the connection
+   * is back, a QR is scanned or a QR window runs out (or after a long enough healthy stretch), so
+   * attempt 1 always opens a fresh episode. The close that ends an unscanned QR window is not a reconnect
+   * and is never reported; any other close while a QR waits is.
+   * `nextDelayMs` is how long the engine waits before making it. Together they are what a consumer
+   * needs to tell a one-second blip from a session that has been down for an hour, which the status
+   * alone cannot: the engine reports INITIALIZING for the whole episode, exactly as it does for a
+   * session that has never been paired.
+   *
+   * Optional: an engine that hands every drop to its consumer instead of retrying internally
+   * (whatsapp-web.js does) simply never invokes this, because that consumer already has the drop.
+   */
+  onReconnecting?: (attempt: number, nextDelayMs: number) => void;
   onStateChanged?: (state: EngineStatus) => void;
   /**
    * Fired when the engine needs an operator action to keep the session healthy — currently only the
@@ -865,7 +929,10 @@ export interface SessionLifecycleCapability {
 
   getQRCode(): string | null;
 
-  /** Request an 8-char pairing code to link via phone number instead of scanning the QR. */
+  /**
+   * Request an 8-char pairing code to link via phone number instead of scanning the QR. Only valid while
+   * the engine is QR_READY; both adapters throw EngineNotReadyError (409) in any other status.
+   */
   requestPairingCode(phoneNumber: string): Promise<string>;
 
   getPhoneNumber(): string | null;
@@ -909,7 +976,11 @@ export interface MessagingCapability {
 
   sendPollMessage(chatId: string, poll: PollInput): Promise<MessageResult>;
 
-  replyToMessage(chatId: string, quotedMsgId: string, text: string): Promise<MessageResult>;
+  /**
+   * Reply to a message, quoting it. `mentions` tags participants exactly as on the send routes: the
+   * text must also carry the matching `@<number>` token for WhatsApp to render the tag.
+   */
+  replyToMessage(chatId: string, quotedMsgId: string, text: string, mentions?: string[]): Promise<MessageResult>;
 
   forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult>;
 }
@@ -930,8 +1001,11 @@ export interface MessageOperationsCapability {
   /**
    * Edit the body of a text message. Only the account's OWN messages can be edited; engines reject
    * non-text or foreign messages at their own layer — the engine's error is surfaced as-is.
+   *
+   * `mentions` re-applies participant tags to the new body. An edit REPLACES the message content, so
+   * omitting it drops whatever tags the original carried rather than preserving them.
    */
-  editMessage(chatId: string, messageId: string, body: string): Promise<MessageResult>;
+  editMessage(chatId: string, messageId: string, body: string, mentions?: string[]): Promise<MessageResult>;
 
   /**
    * Star (bookmark) a message, or remove its star. Starring is a private, account-local marker —
@@ -1297,7 +1371,12 @@ export interface CatalogCapability {
 export interface ChatCapability {
   getChats(): Promise<ChatSummary[]>;
 
-  sendSeen(chatId: string): Promise<boolean>;
+  /**
+   * `messageIds` names exactly which messages to acknowledge. Engines that acknowledge per
+   * message (Baileys) need it to mark a burst, or anything at all after a restart; engines with a
+   * chat-level receipt (whatsapp-web.js) ignore it.
+   */
+  sendSeen(chatId: string, messageIds?: string[]): Promise<boolean>;
 
   markUnread(chatId: string): Promise<boolean>;
 

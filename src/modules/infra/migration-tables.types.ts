@@ -115,6 +115,16 @@ export interface LidMappingRow {
   updatedAt: string;
 }
 
+export interface ChatStateRow {
+  sessionId: string;
+  chatId: string;
+  muteEndTime: number | null;
+  // boolean on Postgres, 0/1 on SQLite; carried through as-is like PluginInstanceRow.enabled.
+  archived: boolean | number;
+  pinned: boolean | number;
+  updatedAt: string;
+}
+
 export interface PluginInstanceRow {
   id: string;
   pluginId: string;
@@ -170,6 +180,20 @@ export interface WebhookDeliveryFailureRow {
   attempts: number;
   lastStatusCode: number | null;
   lastError: string;
+  createdAt: string;
+}
+
+export interface WebhookOutboxEventRow {
+  id: string;
+  webhookId: string;
+  sessionId: string;
+  event: string;
+  idempotencyKey: string;
+  deliveryId: string;
+  payload: string | null;
+  state: string | null;
+  attempts: number;
+  lastAttemptAt: string | null;
   createdAt: string;
 }
 
@@ -236,10 +260,12 @@ export interface MigrationTables {
   templates: TemplateRow[];
   baileysStoredMessages: BaileysStoredMessageRow[];
   lidMappings: LidMappingRow[];
+  chatStates: ChatStateRow[];
   pluginInstances: PluginInstanceRow[];
   conversationMappings: ConversationMappingRow[];
   ingressEvents: IngressEventRow[];
   webhookDeliveryFailures: WebhookDeliveryFailureRow[];
+  webhookOutboxEvents: WebhookOutboxEventRow[];
   integrationDeliveryFailures: IntegrationDeliveryFailureRow[];
   statusUpdates: StatusUpdateRow[];
   automationRules: AutomationRuleRow[];

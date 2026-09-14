@@ -8,10 +8,12 @@ import type {
   TemplateRow,
   BaileysStoredMessageRow,
   LidMappingRow,
+  ChatStateRow,
   PluginInstanceRow,
   ConversationMappingRow,
   IngressEventRow,
   WebhookDeliveryFailureRow,
+  WebhookOutboxEventRow,
   IntegrationDeliveryFailureRow,
   StatusUpdateRow,
   AutomationRuleRow,
@@ -220,6 +222,15 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
     map: (lm: LidMappingRow) => [lm.lid, lm.phone ?? null, lm.sessionId ?? null, lm.updatedAt],
   }),
 
+  // Import chat states (optional; not a FK, restored as a standalone per-session cache table)
+  defineTableImporter({
+    key: 'chatStates',
+    label: 'chat state',
+    sql: `INSERT INTO chat_states ("sessionId", "chatId", "muteEndTime", archived, pinned, "updatedAt") VALUES ($1, $2, $3, $4, $5, $6)`,
+    id: (cs: ChatStateRow) => `${cs.sessionId}/${cs.chatId}`,
+    map: (cs: ChatStateRow) => [cs.sessionId, cs.chatId, cs.muteEndTime ?? null, cs.archived, cs.pinned, cs.updatedAt],
+  }),
+
   // Import plugin instances (Integration Fabric config + ingress HMAC secret)
   defineTableImporter({
     key: 'pluginInstances',
@@ -312,6 +323,30 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
     ],
   }),
 
+  // Import the outbound delivery record. Restoring it restores the replay backlog: a 'pending'
+  // row still carries its payload, so the reconciler on the target instance picks up where the
+  // source left off.
+  defineTableImporter({
+    key: 'webhookOutboxEvents',
+    label: 'webhook outbox event',
+    sql: `INSERT INTO webhook_outbox_events (id, "webhookId", "sessionId", event, "idempotencyKey", "deliveryId", payload, state, attempts, "lastAttemptAt", "createdAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    id: (row: WebhookOutboxEventRow) => row.id,
+    map: (row: WebhookOutboxEventRow) => [
+      row.id,
+      row.webhookId,
+      row.sessionId,
+      row.event,
+      row.idempotencyKey,
+      row.deliveryId,
+      row.payload,
+      row.state,
+      row.attempts,
+      row.lastAttemptAt,
+      row.createdAt,
+    ],
+  }),
+
   // Import integration delivery failures (inbound + outbound DLQ)
   defineTableImporter({
     key: 'integrationDeliveryFailures',
@@ -394,10 +429,12 @@ const EXPECTED_TABLE_KEYS: ReadonlyArray<keyof MigrationTables> = [
   'templates',
   'baileysStoredMessages',
   'lidMappings',
+  'chatStates',
   'pluginInstances',
   'conversationMappings',
   'ingressEvents',
   'webhookDeliveryFailures',
+  'webhookOutboxEvents',
   'integrationDeliveryFailures',
   'statusUpdates',
   'automationRules',

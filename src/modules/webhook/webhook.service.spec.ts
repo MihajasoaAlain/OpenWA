@@ -18,6 +18,7 @@ import { NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { fetch as undiciFetch } from 'undici';
 import { WebhookService } from './webhook.service';
+import { WebhookOutboxService } from './webhook-outbox.service';
 import { WebhookDeliveryService } from './webhook-delivery.service';
 import { Webhook } from './entities/webhook.entity';
 import { WebhookDeliveryFailure } from './entities/webhook-delivery-failure.entity';
@@ -114,6 +115,10 @@ describe('WebhookService', () => {
         WebhookDeliveryService,
         { provide: getRepositoryToken(Webhook, 'data'), useValue: repository },
         { provide: getRepositoryToken(WebhookDeliveryFailure, 'data'), useValue: failureRepository },
+        {
+          provide: WebhookOutboxService,
+          useValue: { open: jest.fn().mockResolvedValue(undefined), close: jest.fn().mockResolvedValue(undefined) },
+        },
         { provide: getRepositoryToken(Session, 'data'), useValue: sessionRepository },
         { provide: ConfigService, useValue: configService },
         { provide: HookManager, useValue: hookManager },
@@ -331,7 +336,7 @@ describe('WebhookService', () => {
 
       await service.findAll();
 
-      expect(repository.find).toHaveBeenCalledWith({ order: { createdAt: 'DESC' }, take: 1000, skip: 0 });
+      expect(repository.find).toHaveBeenCalledWith({ order: { createdAt: 'DESC', id: 'DESC' }, take: 1000, skip: 0 });
     });
 
     it('applies bounded pagination to cross-session listing', async () => {
@@ -341,7 +346,7 @@ describe('WebhookService', () => {
 
       expect(repository.find).toHaveBeenCalledWith({
         where: { sessionId: In(['sess-1']) },
-        order: { createdAt: 'DESC' },
+        order: { createdAt: 'DESC', id: 'DESC' },
         take: 1000,
         skip: 0,
       });
@@ -507,7 +512,7 @@ describe('WebhookService', () => {
       // sessionId resolves through resolveSessionScope, so the WHERE is an IN over the effective scope
       // ([s1] here for an unrestricted key narrowing to one session) — behaviourally the same rows.
       expect(failureRepository.find).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { sessionId: In(['s1']) }, order: { createdAt: 'DESC' } }),
+        expect.objectContaining({ where: { sessionId: In(['s1']) }, order: { createdAt: 'DESC', id: 'DESC' } }),
       );
     });
   });

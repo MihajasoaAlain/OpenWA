@@ -88,12 +88,13 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --only=production
 
-# NOTE: Chrome for Testing has no linux-arm64 build, so this example targets linux/amd64.
-# For arm64, install Debian's `chromium` package and point PUPPETEER_EXECUTABLE_PATH to
-# /usr/bin/chromium — see the repo's Dockerfile for the mixed multi-arch build.
+# NOTE: this example targets linux/amd64. The repo's image keeps Debian's chromium on arm64 by
+# choice (Chrome for Testing publishes linux-arm64 builds only from 153 on). For arm64, install
+# Debian's `chromium` package and point PUPPETEER_EXECUTABLE_PATH to /usr/bin/chromium — see the
+# repo's Dockerfile for the mixed multi-arch build.
 # Download Chrome for Testing via Puppeteer and point ENV to it
 RUN mkdir -p /opt/puppeteer && \
-    PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@146.0.7680.31' && \
+    PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@153.0.8010.36' && \
     chrome_path=$(find /opt/puppeteer/chrome/linux*/chrome-linux64/chrome | head -n 1) && \
     test -n "$chrome_path" && \
     ln -s "$chrome_path" /usr/local/bin/puppeteer-chrome
@@ -274,9 +275,9 @@ volumes:
 > [13 - Horizontal Scaling Guide](./13-horizontal-scaling.md) for the full list and the design
 > sketch. What multi-node eventually buys is engine capacity, not shared engine state: live engine
 > handles live in exactly one process's `EngineRegistry` (`src/engine/engine-registry.service.ts`),
-> and the hard requirements include a stable `NODE_ID` across restarts, NTP-synced clocks (lease
-> skew beyond the TTL wrongfully transfers a session), sticky sessions, `TRUSTED_PROXIES` for
-> forwarded calls, Redis and Postgres.
+> and the hard requirements include a stable `NODE_ID` across restarts, NTP-synced clocks in one
+> time zone without daylight saving (lease skew beyond the TTL wrongfully transfers a session),
+> sticky sessions, `TRUSTED_PROXIES` for forwarded calls, Redis and Postgres.
 
 ### Helm Chart (Kubernetes)
 
@@ -305,17 +306,17 @@ an illustrative design sketch; the chart is the authoritative artifact.
 SHA image tags to GHCR; `latest` is deliberately not set there and moves only through the separate,
 boot-smoke-gated release workflow.
 
-| Job             | Needs                                              | What it runs                                                                                                                                                                                                                                                                 |
-| --------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lint`          | —                                                  | ESLint, `tsc --noEmit -p tsconfig.json` (full program, so spec files are type-checked too), `format:check`, `check:versions`, `check:dockerignore`, `openapi:check`, `check:sdk-routes`, `check:sdk-coverage`, `check:sdk-events`, `check:sdk-docs`, `check:contract-shapes` |
-| `audit`         | —                                                  | `npm run check:audit` (root, high/critical with a per-advisory allowlist) + `npm audit --audit-level=high` (dashboard), split out of `lint` so a newly published advisory can't abort the code-quality gates                                                                 |
-| `test`          | —                                                  | `npm test -- --coverage`, `test:docs` (repo-file drift specs), `test:scripts`, `test:e2e` (a `redis:7-alpine` service backs the queue-on e2e suite), coverage upload                                                                                                         |
-| `test-postgres` | —                                                  | `npm run build`, then `test:pg-smoke` (migrations + uuid-default) and the Postgres FTS migration spec against a `postgres:16-alpine` service                                                                                                                                 |
-| `dashboard`     | —                                                  | In `dashboard/`: `lint`, `typecheck`, `i18n:check`, `build`, `test:unit`                                                                                                                                                                                                     |
-| `scripts-smoke` | —                                                  | `shellcheck` plus the backup/restore smoke test for `scripts/backup.sh` and `scripts/restore.sh`                                                                                                                                                                             |
-| `chart`         | —                                                  | `helm lint` + template rendering of `charts/openwa`, `actionlint` for the workflows, and a behaviour check on the chart's values (`check:chart`)                                                                                                                             |
-| `build`         | lint, audit, test, dashboard, scripts-smoke, chart | `npm run build`, uploads the `dist` artifact                                                                                                                                                                                                                                 |
-| `docker`        | build, test-postgres                               | Buildx multi-arch build (`linux/amd64,linux/arm64`) with provenance + SBOM attestations, then the non-root drop smoke (`scripts/smoke-test-non-root.sh`); pushes to `ghcr.io/<owner>/<repo>` on push events (fork PRs build both architectures without publishing)           |
+The per-job step lists live in [docs/09 §9.6](./09-testing-strategy.md#96-ci-checks), which a spec
+keeps in sync with the workflow (`src/common/docs-ci-jobs.spec.ts`). Restating them here is what let
+this section rot: it described a `dashboard` job with no formatting step and a `chart` job with no
+kubeconform long after both had one. What this page adds instead is the shape of the graph.
+
+Seven jobs run in parallel with no dependencies: `lint`, `audit`, `test`, `test-postgres`,
+`dashboard`, `scripts-smoke` and `chart`. `build` waits on all of them except `test-postgres`
+(`needs: lint, audit, test, dashboard, scripts-smoke, chart`), and `docker` waits on `build` and
+`test-postgres`, so the image is only built from a tree that passed every gate including the real
+PostgreSQL run. `docker` pushes to `ghcr.io/<owner>/<repo>` on push events; fork pull requests build
+both architectures without publishing.
 
 Rollout is left to the operator — the repo has no SSH deploy step, no staging/production
 environments and no auto-deploy on merge.
@@ -466,6 +467,9 @@ SESSION_DATA_PATH=./data/sessions
 PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 PUPPETEER_HEADLESS=true
 PUPPETEER_ARGS=--no-sandbox,--disable-setuid-sandbox
+# Optional per-browser-command budget, ms. Unset = Puppeteer's own budget. Raise only after seeing
+# "Runtime.callFunctionOn timed out"; positive integer, max 2147483647 (cost: see docs/12).
+# PUPPETEER_PROTOCOL_TIMEOUT_MS=300000
 
 # ===========================================
 # SECURITY

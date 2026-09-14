@@ -1,9 +1,10 @@
-import type { WAMessageKey, WASocket } from '@whiskeysockets/baileys';
+import type { WAMessage, WAMessageKey, WASocket } from '@whiskeysockets/baileys';
 import { ChatSummary, Contact, MediaInput } from '../interfaces/whatsapp-engine.interface';
 import { resolveMediaBuffer } from './baileys-messaging';
 import { type createLogger } from '../../common/services/logger.service';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
+import { RecipientUnreachableError } from '../../common/errors/recipient-unreachable.error';
 
 /**
  * Contacts/profile/chats-domain operations extracted from BaileysAdapter. The adapter keeps the
@@ -22,6 +23,12 @@ export interface BaileysContactsHost {
   listChats(): ChatSummary[];
   /** The chat's last known message (the handle readMessages/chatModify need), or null when none. */
   lastMessage(chatId: string): { key: WAMessageKey; timestamp: number } | null;
+  /**
+   * Stored copies of the named messages, in whatever order the store returns them. Ids the store
+   * has never seen are absent, so neither the length nor the order tracks the input. `undefined`
+   * when the session was built without a message store.
+   */
+  getStoredMessages(messageIds: string[]): Promise<WAMessage[]> | undefined;
   /** Fold a neutral @c.us id to the engine @s.whatsapp.net form used as the app-state index key. */
   toEngineJid(jid: string): string;
   /** Fold an engine jid back to the neutral dialect before it crosses the engine boundary. */
@@ -101,15 +108,41 @@ export class BaileysContacts {
     await this.confirmed(this.sock().removeContact(this.host.toEngineJid(contactId)), 'the contact removal');
   }
 
+  /**
+   * `updateBlockStatus` maps the id between the phone-number and privacy-id dialects before it sends
+   * anything, and refuses one it cannot map with `Boom(..., { statusCode: 400 })`: no phone number
+   * for a lid, no lid for a phone number, or an id that is neither. Boom is not an HttpException, so
+   * those reached the caller as an opaque `500 Internal server error` even though the request was
+   * well-formed and the id is a shape this API accepts.
+   *
+   * Only a 400 is folded in. A dropped connection carries `DisconnectReason.connectionClosed` and the
+   * write deadline throws `EngineTransportError`, and reporting either as a bad contact id would send
+   * the caller after the wrong problem. whatsapp-web.js already answers `RecipientUnreachableError`
+   * (400) for the same cause on the send path, so this is the parity mapping, not a new contract.
+   */
+  private async mapUnresolvableId<T>(contactId: string, op: () => Promise<T>): Promise<T> {
+    try {
+      return await op();
+    } catch (error) {
+      const status = (error as { output?: { statusCode?: unknown } } | null)?.output?.statusCode;
+      if (status === 400) throw new RecipientUnreachableError(contactId);
+      throw error;
+    }
+  }
+
   async blockContact(contactId: string): Promise<void> {
     this.host.ensureReady();
-    await this.confirmed(this.sock().updateBlockStatus(contactId, 'block'), 'the block');
+    await this.mapUnresolvableId(contactId, () =>
+      this.confirmed(this.sock().updateBlockStatus(contactId, 'block'), 'the block'),
+    );
     this.invalidateBlocklist();
   }
 
   async unblockContact(contactId: string): Promise<void> {
     this.host.ensureReady();
-    await this.confirmed(this.sock().updateBlockStatus(contactId, 'unblock'), 'the unblock');
+    await this.mapUnresolvableId(contactId, () =>
+      this.confirmed(this.sock().updateBlockStatus(contactId, 'unblock'), 'the unblock'),
+    );
     this.invalidateBlocklist();
   }
 
@@ -291,17 +324,64 @@ export class BaileysContacts {
     return this.host.listChats();
   }
 
-  async sendSeen(chatId: string): Promise<boolean> {
+  async sendSeen(chatId: string, messageIds?: string[]): Promise<boolean> {
     this.host.ensureReady();
-    const last = this.host.lastMessage(chatId);
-    if (!last) {
+    const keys = await this.receiptKeys(chatId, messageIds);
+    if (keys.length === 0) {
       return false; // nothing known to mark read
     }
     // readMessages reaches fetchPrivacySettings, which destructures the query result and throws a
     // raw TypeError on an unanswered one — no Boom, so nothing downstream can classify it. Marking
     // a chat read is idempotent, so bounding it is safe: a repeat costs nothing.
-    await this.confirmed(this.sock().readMessages([last.key]), 'the read receipt');
+    await this.confirmed(this.sock().readMessages(keys), 'the read receipt');
     return true;
+  }
+
+  /**
+   * The keys a read receipt should acknowledge: the messages the caller named, or the chat's newest
+   * one when it named none.
+   *
+   * Baileys acknowledges individual messages, not chats, and the receipt node enumerates ids rather
+   * than carrying a read-up-to watermark. Caller-supplied ids are what make that correct: the
+   * lastMessage fallback holds only the newest message, so a burst of three inbound messages left
+   * the first two permanently unread, and a session that restarted since the message arrived had
+   * nothing to acknowledge at all (a silent false under a 200).
+   *
+   * Named ids are resolved through the message store rather than synthesised, because the receipt
+   * needs the whole key. A synthesised key carries no `participant`, so a group receipt names no
+   * sender; its hardcoded `fromMe: false` is wrong for an id that belongs to an outbound message;
+   * and its jid is whichever dialect the caller happened to send. The stored key has all three
+   * right. Ids the store has never seen — history backfill is emitted but not persisted — keep the
+   * synthesised key, which is what the 1:1 case ran on before.
+   */
+  private async receiptKeys(chatId: string, messageIds?: string[]): Promise<WAMessageKey[]> {
+    // null as well as undefined: the REST body rejects an explicit null, but this is the engine
+    // boundary and an internal caller reaching it with one used to dereference it below as a 500.
+    if (messageIds === undefined || messageIds === null) {
+      const last = this.host.lastMessage(chatId);
+      return last ? [last.key] : [];
+    }
+    if (messageIds.length === 0) {
+      return []; // an explicit empty list asks for nothing to be acknowledged, not for the newest
+    }
+    const remoteJid = this.host.toEngineJid(chatId);
+    const stored = (await this.host.getStoredMessages(messageIds)) ?? [];
+    // A stored key is only usable when it belongs to THIS chat. Without the check, an id from
+    // another chat in the same session carried that chat's remoteJid into readMessages, so the
+    // receipt landed there while the route answered success for the chat the caller named.
+    // The comparison runs in the NEUTRAL dialect rather than the engine one: toEngineJid folds
+    // @c.us and @s.whatsapp.net together but returns @lid untouched, and Baileys stores a DM key
+    // under the peer's lid once WhatsApp addresses the chat that way. toNeutralJid resolves that
+    // lid to its phone user-part through the session's lid mapping, so both spellings of one chat
+    // still meet. Anything that still differs falls back to the synthesised key for the ADDRESSED
+    // chat, which is exactly what every id ran on before stored keys existed.
+    const chatKey = this.host.toNeutralJid(chatId);
+    const keyById = new Map(
+      stored
+        .filter(msg => msg.key?.id && msg.key.remoteJid && this.host.toNeutralJid(msg.key.remoteJid) === chatKey)
+        .map(msg => [msg.key.id as string, msg.key]),
+    );
+    return messageIds.map(id => keyById.get(id) ?? { remoteJid, id, fromMe: false });
   }
 
   async markUnread(chatId: string): Promise<boolean> {

@@ -596,12 +596,22 @@ export class InfraDataService {
         // lid_mappings is not a FK to sessions, so the sessions DELETE below won't clear it; clear it
         // explicitly so a restore replaces the cache rather than colliding on existing lid PKs.
         await clearTable('lid_mappings');
+        // chat_states is the same case: PK (sessionId, chatId), no FK to sessions, so the sessions DELETE
+        // does not reach it. Without this, a restore onto an instance that already holds chat_states rows
+        // collides on those PKs and the all-or-nothing gate rolls the whole import back.
+        await clearTable('chat_states');
         // Integration Fabric + both DLQs: none carry an FK constraint to sessions (sessionId is provenance),
         // so clearing them here before the sessions DELETE keeps the replace-semantics complete.
         await clearTable('plugin_instances');
         await clearTable('conversation_mappings');
         await clearTable('ingress_events');
         await clearTable('webhook_delivery_failures');
+        // Same rule, and it bites harder here: webhook_outbox_events carries UNIQUE(webhookId,
+        // idempotencyKey), so without this clear a restore onto an instance that already holds the
+        // archive's rows collides on every one of them, and the all-or-nothing gate below rolls the
+        // whole import back. Restoring a backup onto the instance that produced it is exactly the
+        // rollback flow, so leaving it out broke the recovery path rather than a corner of it.
+        await clearTable('webhook_outbox_events');
         await clearTable('integration_delivery_failures');
         // status_updates has no FK to sessions; clear it explicitly so the replace is complete.
         await clearTable('status_updates');
@@ -673,8 +683,10 @@ export class InfraDataService {
         // initializing, ...) in a backup describes the SOURCE host's engines, and restoring it
         // verbatim leaves rows reading ready with no engine anywhere - invisible to auto-start
         // (selects disconnected) and to the takeover sweep, until a process restart. Scoped to
-        // CLAIMABLE rows only, so a session whose ownership claim was just re-applied to this
-        // node or a peer (a live engine still backs it) keeps the backup's status.
+        // CLAIMABLE rows: a PEER's preserved claim (a live engine backs the row elsewhere) keeps
+        // the backup's status; this node's own claims normalize exactly like boot's reset does -
+        // for a live self-engine the row understates reality until the next engine status event,
+        // which is the same trade boot makes.
         const ACTIVE_STATUSES = [
           SessionStatus.READY,
           SessionStatus.INITIALIZING,

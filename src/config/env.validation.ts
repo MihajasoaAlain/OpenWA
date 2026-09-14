@@ -9,6 +9,10 @@ type EnvConfig = Record<string, unknown>;
 // DATABASE_NAME still points at the (now unused) default file.
 const MAIN_DB_DEFAULT_PATH = './data/main.sqlite';
 
+// Duplicated rather than imported from configuration.ts (see MAIN_DB_DEFAULT_PATH above); the spec
+// asserts the two agree.
+const MAX_TIMER_MS = 2147483647;
+
 /**
  * Collision guard shared by boot validation (validateEnv below) and the migration CLI
  * (src/database/data-source.ts / data-source-main.ts — the TypeORM CLI never runs ConfigModule's
@@ -220,6 +224,28 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     checkInt(key);
   }
 
+  // BAILEYS_WA_VERSION: optional version pin for the Baileys engine (e.g. 2.3000.1045340097 or 2,3000,1045340097)
+  for (const key of ['BAILEYS_WA_VERSION']) {
+    const raw = str(key);
+    if (raw !== undefined) {
+      const match = raw.match(/^(\d+)[.,](\d+)[.,](\d+)$/);
+      if (!match) {
+        errors.push(
+          `${key} must be a valid WhatsApp Web version (e.g. "2.3000.1045340097"; got ${JSON.stringify(raw)})`,
+        );
+      } else {
+        const major = parseInt(match[1], 10);
+        const minor = parseInt(match[2], 10);
+        const patch = parseInt(match[3], 10);
+        if (major !== 2 || minor < 2000 || patch < 0) {
+          errors.push(
+            `${key} must be a valid WhatsApp Web version (e.g. "2.3000.1045340097"; got ${JSON.stringify(raw)})`,
+          );
+        }
+      }
+    }
+  }
+
   // Some knobs are nonsensical at 0 and contradict the "non-negative" intent: a rate-limit LIMIT of 0
   // disables that tier's throttling (a self-DoS), and a webhook timeout of 0 aborts every delivery
   // immediately. Require a positive integer for these.
@@ -243,6 +269,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'WS_MAX_SOCKETS_PER_KEY',
     'WEBHOOK_TIMEOUT',
     'INGRESS_INSTANCE_LIMIT',
+    'INGRESS_IP_LIMIT',
     'REQUEST_TIMEOUT_MS',
     'HEADERS_TIMEOUT_MS',
     'KEEPALIVE_TIMEOUT_MS',
@@ -261,8 +288,36 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'SESSION_LEASE_HEARTBEAT_MS',
     'SESSION_TAKEOVER_SWEEP_MS',
     'SESSION_PROXY_TIMEOUT_MS',
+    // Positive-only is the POINT here, not a convention: 0 arms no Puppeteer timer at all, so a
+    // wedged renderer holds the request forever (see wwebjs-lifecycle.ts).
+    'PUPPETEER_PROTOCOL_TIMEOUT_MS',
+    // The media knobs take RAW numbers while their neighbours in .env.example and docs/12 take unit
+    // strings (`BODY_SIZE_LIMIT=25mb`), and their read sites parse with `Number.parseInt`. That
+    // accepts the leading digits of a unit-suffixed value and discards the unit, so
+    // `MEDIA_DOWNLOAD_MAX_BYTES=50mb` became a 50 BYTE cap and `MEDIA_DOWNLOAD_TIMEOUT_MS=30s`
+    // became 30 ms: every download fails, and the "garbage falls back to the default" the helpers
+    // promise never fires because 50 is a perfectly good positive integer. Reject at boot instead,
+    // which is what the two inline-media budgets below already do.
+    'MEDIA_DOWNLOAD_MAX_BYTES',
+    'MEDIA_DOWNLOAD_TIMEOUT_MS',
+    'INBOUND_MEDIA_CONCURRENCY',
+    'CHAT_HISTORY_MEDIA_BUDGET_BYTES',
   ]) {
     checkPositiveInt(key);
+  }
+
+  // The ceiling matters for the same reason from the other side: the docs forbid 0, so an operator
+  // who wants an effectively unlimited budget reaches for a row of nines. Rejected at boot rather
+  // than clamped, so they learn the value they wrote is not the value they would have got.
+  {
+    const raw = str('PUPPETEER_PROTOCOL_TIMEOUT_MS');
+    const n = raw !== undefined && DECIMAL_INTEGER.test(raw) ? Number(raw) : NaN;
+    if (Number.isInteger(n) && n > MAX_TIMER_MS) {
+      errors.push(
+        `PUPPETEER_PROTOCOL_TIMEOUT_MS must not exceed ${MAX_TIMER_MS} ms (got "${raw}"): Node's ` +
+          `timers overflow above that and fire after 1 ms, so the browser never finishes launching`,
+      );
+    }
   }
 
   // A heartbeat that does not fit inside the lease renews too late to matter: the claim lapses
@@ -423,6 +478,20 @@ export function validateEnv(config: EnvConfig): EnvConfig {
   const provider = config['SEARCH_PROVIDER'] as string | undefined;
   if (provider !== undefined && provider !== '' && !['auto', 'builtin-fts', 'none'].includes(provider)) {
     errors.push(`SEARCH_PROVIDER must be one of: auto, builtin-fts, none (got ${JSON.stringify(provider)})`);
+  }
+
+  // LOG_LEVEL is read in main.ts by exact match after trim+toLowerCase, so any casing works today
+  // and only a MISSPELLING differs: every unrecognised value silently means INFO, which is MORE
+  // logging than the operator asked for (Nest-adjacent spellings like 'log', 'trace' or 'fatal'
+  // included, none of them this repo's vocabulary). Validate the normalised form, mirroring the
+  // read site exactly (same philosophy as MEDIA_DOWNLOAD_ENABLED above): nothing that works today
+  // is refused, and a misspelling fails the boot instead of quietly logging at info.
+  const LOG_LEVEL_VALUES = ['error', 'warn', 'info', 'debug', 'verbose'];
+  const rawLogLevel = str('LOG_LEVEL');
+  if (rawLogLevel !== undefined && !LOG_LEVEL_VALUES.includes(rawLogLevel.toLowerCase())) {
+    errors.push(
+      `LOG_LEVEL must be one of ${LOG_LEVEL_VALUES.map(v => `"${v}"`).join(', ')} (got ${JSON.stringify(rawLogLevel)})`,
+    );
   }
 
   if (errors.length > 0) {

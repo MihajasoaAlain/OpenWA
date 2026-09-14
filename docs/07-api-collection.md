@@ -118,6 +118,26 @@ curl -X POST "$BASE/api/sessions" \
   -d '{ "name": "my-bot", "proxyUrl": "http://user:pass@your-real-proxy.host:8080", "proxyType": "http" }'
 ```
 
+#### GET /api/sessions/:sessionId/proxy
+
+Read a session's masked proxy configuration (credentials never returned).
+
+```bash
+curl "$BASE/api/sessions/$SESSION_ID/proxy" \
+  -H "X-API-Key: $API_KEY"
+```
+
+#### PATCH /api/sessions/:sessionId/proxy
+
+Update per-session proxy settings (OPERATOR). No restart — changes apply on the next start. Send `"proxyUrl": null` to clear.
+
+```bash
+curl -X PATCH "$BASE/api/sessions/$SESSION_ID/proxy" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "proxyUrl": "http://user:pass@your-real-proxy.host:8080" }'
+```
+
 #### POST /api/sessions/:sessionId/start
 
 Start a session and initialize the connection (OPERATOR).
@@ -214,8 +234,11 @@ Mark a chat as read/seen (OPERATOR).
 curl -X POST "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/chats/read" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{ "chatId": "1234567890@c.us" }'
+  -d '{ "chatId": "1234567890@c.us", "messageIds": ["3EB0C767D26B8A3F1A2B"] }'
 ```
+
+`messageIds` is optional and holds up to 100 ids. Omit it and only the newest message the engine still
+holds in memory is acknowledged, which on Baileys leaves the earlier messages of a burst unread.
 
 #### POST /api/sessions/:sessionId/chats/unread
 
@@ -686,7 +709,7 @@ curl -X GET "$BASE/api/sessions/$SESSION_ID/groups/120363021234567890@g.us" \
 
 #### GET /api/sessions/:sessionId/groups/:groupId/invite-code
 
-Get the group invite code and full invite link.
+Get the group invite code and full invite link (OPERATOR).
 
 ```bash
 curl -X GET "$BASE/api/sessions/$SESSION_ID/groups/120363021234567890@g.us/invite-code" \
@@ -1133,7 +1156,7 @@ curl -X POST "$BASE/api/sessions/$SESSION_ID/webhooks" \
   -d '{
     "url": "https://your-server.com/webhook",
     "events": ["message.received", "session.status"],
-    "secret": "your-secret-key",
+    "secret": "your-webhook-signing-secret",
     "headers": { "X-Custom-Header": "value" },
     "filters": {
       "conditions": [
@@ -1265,10 +1288,13 @@ curl -X POST "$BASE/api/auth/validate" \
 
 #### GET /api/health
 
-Basic health check (status, timestamp, version). Public.
+Basic health check (status, timestamp). Public. The running `version` is added only when the request carries a valid API key, so an unauthenticated probe gets `status` and `timestamp` alone.
 
 ```bash
 curl "$BASE/api/health"
+
+# With the version field:
+curl -H "X-API-Key: $API_KEY" "$BASE/api/health"
 ```
 
 #### GET /api/health/live

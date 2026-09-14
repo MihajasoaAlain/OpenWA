@@ -278,7 +278,7 @@ curl -X POST "$BASE/api/sessions" -H "X-API-Key: $API_KEY" -H "Content-Type: app
 
 ### Issue: Session stuck at `authenticating`, never reaches `ready`
 
-> **Engine:** This issue applies to the `whatsapp-web.js` engine only. If you are using `ENGINE_TYPE=baileys`, skip this section.
+> **Engine:** This stall applies to the `whatsapp-web.js` engine only. Baileys also reports `authenticating`, but only for the seconds between WhatsApp accepting the link and the restart it requests; it cannot park there, so if you are using `ENGINE_TYPE=baileys`, skip this section.
 
 **Symptoms:** After scanning the QR the phone links the device, but the session stays at
 `authenticating` indefinitely and never becomes `ready`. `GET /sessions/:sessionId/qr` returns 400 while
@@ -419,7 +419,7 @@ custom container that drops the `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` setup or th
 
 **Cause D — Debian 12 OS Chromium SIGTRAP in non-root Pods.**
 If `Code: null` happens on Kubernetes, and the host kernel logs or `dmesg` shows `Trace/breakpoint trap (core dumped)` with exit code 133, the underlying Debian 12 OS `chromium` package has crashed due to strict non-root or seccomp constraints (even with `--no-zygote` or `Unconfined` seccomp).
-_Fix:_ On amd64, do not use the `chromium` package from Debian's `apt` — it SIGTRAPs under strict non-root/seccomp. Instead, download Chrome for Testing via Puppeteer during the Docker build (`./node_modules/.bin/puppeteer browsers install 'chrome@146.0.7680.31'`) and point `PUPPETEER_EXECUTABLE_PATH` to it. (Chrome for Testing has no linux-arm64 build, so arm64 keeps Debian's `chromium`, which ships a native arm64 binary.) The official `Dockerfile` implements this mixed approach.
+_Fix:_ On amd64, do not use the `chromium` package from Debian's `apt` — it SIGTRAPs under strict non-root/seccomp. Instead, download Chrome for Testing via Puppeteer during the Docker build (`./node_modules/.bin/puppeteer browsers install 'chrome@153.0.8010.36'`) and point `PUPPETEER_EXECUTABLE_PATH` to it. (arm64 keeps Debian's `chromium`, which ships a native arm64 binary, by choice: Chrome for Testing publishes linux-arm64 builds only from 153, and the image has not moved arm64 to one.) The official `Dockerfile` implements this mixed approach.
 
 **Quick triage:** run `docker stats openwa-api`, click **Start**, and watch which resource spikes toward its
 limit the instant before the failure — that tells you A vs B. If neither moves and you see the crashpad
@@ -447,6 +447,15 @@ trigger today is the **v0.8.12** amd64 switch from Debian's `chromium` package t
 reads like a Puppeteer bug and gives no hint that the profile is the cause — the adapter now logs an
 advisory when it detects this error, and the session's `lastError` (the message the dashboard shows on
 the session card) carries a short form of it, so the pointer survives without reading the container log.
+
+**Rolling back to an older browser** does not raise this error. An older Chrome silently deletes the
+IndexedDB of a profile a newer Chrome has opened, and that is where whatsapp-web.js keeps the WhatsApp
+login: every previously linked session starts at a QR code instead of reconnecting, the log names no
+cause (0.23.3 and 0.23.4 log only a generic `relink_required` warning), and upgrading again does not bring
+the pairing back. On amd64 this follows a rollback from 0.23.5 or later (Chrome for Testing 153) to 0.23.4
+or earlier (146); on arm64, a rollback to an image built with an older Debian chromium major. Restoring
+`sessions/` from a backup taken before the first start on the newer image keeps the pairing (see the
+upgrade runbook's rollback in docs/11); without one, scan a new QR.
 
 **Fix:** delete the affected session's profile dir and start the session again to scan a new QR. The
 profile cannot be salvaged — clearing only the cache subdirs (`Cache`, `GPUCache`, `Code Cache`, …) is
@@ -665,6 +674,83 @@ rm -rf node_modules/whatsapp-web.js && npm ci
 > Pinning `WWEBJS_WEB_VERSION` does **not** work around this — the rename is present in every
 > current WhatsApp Web build, so no pin avoids it.
 
+### Issue: Startup logs say install-time patches are missing
+
+**Symptoms:**
+
+- Startup logs contain `The installed whatsapp-web.js is missing N of OpenWA's install-time patches: …`,
+  or the same line naming `@whiskeysockets/baileys`
+- One capability fails while everything around it works: an unnamed `500` from a single route,
+  block/unblock refusing every id, a status media send that never arrives, a group description that
+  cannot be set, an app-state resync that never settles
+
+**Cause:** OpenWA applies nine exact source transforms to its engine libraries at install time
+(docs/29 §29.3). The Docker image runs them without `--best-effort`, so a source shape a patcher
+cannot recognise fails the image build. A source install runs them through `scripts/postinstall.js`
+with `--best-effort`, where a patcher that cannot apply prints one line into a long `npm install`
+transcript and the install still succeeds. The usual causes are `npm install --ignore-scripts` and
+an upstream release whose shape a patcher no longer recognises. Each engine now checks its own
+patches as it starts and names the ones that did not land, so the report arrives on the machine that
+is actually affected rather than in an install log nobody kept.
+
+**Solution:**
+
+```bash
+# Which patches are missing? Works on every platform, including Windows without grep.
+node -e "const fs=require('fs'),p=require('path');for(const f of fs.readdirSync('scripts').filter(n=>n.startsWith('patch-')&&n.endsWith('.js')&&!n.endsWith('.spec.js')).sort()){const m=require('./scripts/'+f);if(typeof m.isApplied!=='function')continue;const k=f.startsWith('patch-wwebjs-')?'whatsapp-web.js':'@whiskeysockets/baileys';try{console.log((m.isApplied(p.dirname(require.resolve(k+'/package.json')))?'APPLIED    ':'NOT APPLIED')+' '+f)}catch{}}"
+
+# Apply each one it named, then restart
+node scripts/patch-wwebjs-group-description.js
+```
+
+If a patcher answers with an unsupported-shape error instead of applying, the installed library has
+moved and the transform needs re-evaluating against it. Reinstalling will not help; open an issue
+quoting the message it printed.
+
+> `patch-wwebjs-201832.js` is not in that list. It carries its own startup check and its own entry
+> above, because a partially applied backport needs different advice than one that never ran.
+
+> A patch that never applied is not fatal on its own: only the capability it repairs is affected and
+> the rest of the gateway runs normally, which is why this is easy to misread as a bug in one route.
+
+### Issue: Reads on a large account fail with `Runtime.callFunctionOn timed out`
+
+> **Engine:** This issue applies to the `whatsapp-web.js` engine only (Chromium/Puppeteer-based). It does not affect `ENGINE_TYPE=baileys`.
+
+**Symptoms:**
+
+- `GET /api/sessions/{id}/chats` (or another read that walks the whole store) fails on an account
+  with thousands of chats, while smaller accounts on the same deployment are fine
+- The error names a CDP method and the setting: `Runtime.callFunctionOn timed out. Increase the 'protocolTimeout' setting in launch/connect calls for a higher timeout if needed.`
+- The session stays `ready` and the next request works, so the page did not die
+
+**Cause:** Puppeteer gives every browser command a time budget, 180 000 ms by default, and one
+`getChats()` over a very large store can run past it. The renderer is still working; only the
+command is dropped. That is also why this is **not** treated as a dead page — a transport death
+answers `503` and takes the session down with it, and this is just a slow command on a live page.
+
+**Solution:** raise the budget for that deployment.
+
+```bash
+# 5 minutes, in .env or the environment. Unset means Puppeteer's own 180000.
+PUPPETEER_PROTOCOL_TIMEOUT_MS=300000
+```
+
+Raise it by as little as the account needs. The budget bounds a command that is slow but still
+running; it is not what protects you from a **wedged** browser. A page that stops answering is
+caught by the liveness watchdog, which probes every 60 s with a 15 s timeout and treats two
+consecutive failures as a disconnect, so a wedge is picked up in roughly 75 to 135 s whatever this
+value is. There is no measurement in this repo saying how large an account has to be before 180000
+is too small, so treat any value above it as an escape hatch you reached for after seeing the error
+above, not as a default worth pre-emptively setting.
+
+> Do not set it to `0`, and do not reach for a row of nines. The gateway refuses to boot on either.
+> Puppeteer only arms its timer for a truthy value, so `0` drops the bound altogether and a wedged
+> renderer will hold the command, and the request waiting on it, forever — a hung request is worse
+> than a failed one. Above `2147483647` Node's timer overflows, warns `TimeoutOverflowWarning`, and
+> fires after 1 ms instead, so every command in the launch handshake fails with this same error and
+> the browser never starts.
+
 ### Issue: Media Upload Fails
 
 **Symptoms:**
@@ -687,6 +773,11 @@ BODY_SIZE_LIMIT=25mb
 # Note: send the body uncompressed. A request carrying Content-Encoding: gzip (or deflate/br)
 # is refused with 415 — the aggregate in-flight cap counts bytes on the wire, so a compressed
 # body would be admitted small and then inflated past the memory that cap exists to bound.
+
+# Note: one client IP may hold at most half the aggregate in-flight budget, and is refused with
+# 503 + Retry-After past that even while the gateway as a whole has room. Behind a reverse proxy,
+# set TRUSTED_PROXIES: without it every caller resolves to the proxy's own address and shares a
+# single half, which looks like a 503 at half the budget you configured.
 
 # Supported formats
 # Images: jpg, jpeg, png, gif, webp
